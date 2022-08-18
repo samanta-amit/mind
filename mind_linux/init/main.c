@@ -493,7 +493,9 @@ void __init __weak mem_encrypt_init(void) { }
 #ifdef CONFIG_COMPUTE_NODE
 extern void disagg_network_init(void);
 extern void disagg_cn_thread_init(void);
+//extern void disagg_container_init(void);
 // extern void disagg_rdma_init(void);
+// extern void disagg_futex_init(void);
 #endif
 
 /*
@@ -1107,6 +1109,10 @@ static noinline void __init kernel_init_freeable(void)
 
 	/* cache/memory manager initialization for disaggregated system */
 	disagg_cn_thread_init();
+
+    /* init kernel structures for container process */
+    //disagg_container_init();
+	//disagg_futex_init();
 #endif
 
 	/*

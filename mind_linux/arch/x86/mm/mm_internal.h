@@ -23,8 +23,7 @@ void update_cache_mode_entry(unsigned entry, enum page_cache_mode cache);
 void
 do_disagg_page_fault(struct task_struct *tsk, struct pt_regs *regs, 
 		unsigned long error_code, unsigned long address, unsigned int flags);
-void print_pgfault_error(struct task_struct *tsk, unsigned long error_code,
-						 unsigned long address, struct vm_area_struct *vma);
+extern int is_kshmem_address(unsigned long addr);
 #endif /* CONFIG_COMPUTE_NODE */
 
 #endif	/* __X86_MM_INTERNAL_H */

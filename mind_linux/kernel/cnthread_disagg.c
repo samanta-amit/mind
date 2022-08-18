@@ -1,4 +1,5 @@
 #include <disagg/cnthread_disagg.h>
+#include <disagg/kshmem_disagg.h>
 #include <disagg/exec_disagg.h>
 #include <disagg/fault_disagg.h>
 #include <disagg/profile_points_disagg.h>
@@ -23,6 +24,8 @@
 #include <asm/cacheflush.h>
 #include <asm/byteorder.h>
 
+#include <linux/smp.h>
+
 static spinlock_t cnthread_lock;
 static spinlock_t free_page_put_lock;   // Aadd to the list
 static spinlock_t free_page_get_lock;   // Get one from the list
@@ -37,13 +40,11 @@ static spinlock_t cnthread_evict_range_lock;
 static spinlock_t cn_fh_per_core_lock[DISAGG_NUM_CPU_CORE_IN_COMPUTING_BLADE];
 static spinlock_t cnthread_inval_ack_lock;
 static spinlock_t cnthread_inval_buf_write_lock;
-static spinlock_t cnthread_inval_req_list_lock;
 static spinlock_t cnthread_pgfault_helper_lock[PG_FAULT_HELPER_CPU];
 
 static LIST_HEAD(cn_handler_lru_list);
 static LIST_HEAD(cn_free_page_list);
 static LIST_HEAD(cn_free_cacheline_list);
-static LIST_HEAD(cn_inval_req_list);
 
 static struct hlist_head lru_list_hashtable[NUM_HASH_BUCKETS];
 static struct hlist_head cn_cache_waiting_list[NUM_HASH_WAIT_LIST];
@@ -53,7 +54,6 @@ static atomic_t cnthread_evict_counter;
 static atomic_t cn_free_page_counter;
 static atomic_t cn_free_cacheline_counter;
 static atomic_long_t cn_total_eviction_counter;
-static atomic_t cnthread_inv_req_counter;
 static atomic_t cnthread_buf_head_inv_splitter;
 static atomic_t cnthread_pgfault_helper_idx;
 
@@ -62,15 +62,28 @@ static int _high_threshold = (int)(CNTHREAD_HIGH_CACHE_PERSSURE * (float)CNTHREA
 static int _page_free_threshold = (int)((float)(1.0 - CNTHREAD_CACHED_PERSSURE) * (float)CNTHREAD_MAX_CACHE_BLOCK_NUMBER);
 static int _page_high_free_threshold = (int)((float)(1.0 - CNTHREAD_HIGH_CACHE_PERSSURE) * (float)CNTHREAD_MAX_CACHE_BLOCK_NUMBER);
 
+// Priority task queues
+static spinlock_t cnthread_task_queue_locks[CNTHREAD_TASK_QUEUE_NUM];
+// static spinlock_t cnthread_inval_req_list_lock;
+// static spinlock_t cnthread_async_req_list_lock;
+// static LIST_HEAD(cn_inval_req_list);
+// static LIST_HEAD(cn_async_req_list);
+static struct list_head cnthread_task_queues[CNTHREAD_TASK_QUEUE_NUM];
+static atomic_t cnthread_inv_req_counter;
+static atomic_t cnthread_async_req_counter;
+
 // Buffer for RDMA-based invalidation
 static unsigned char* base_inval_buf[DISAGG_QP_NUM_INVAL_BUF] = {NULL};
 static unsigned int inval_buf_head = 0;
 static unsigned int inval_buf_ack_head[DISAGG_QP_NUM_INVAL_BUF] = {0};
 static spinlock_t cnthread_inval_head_buf_lock[DISAGG_QP_NUM_INVAL_BUF];
 
-int cnthread_handler(void *data);
-int cache_ack_handler(void *data);
-static int check_inval_req_list_and_try(int from_inv, struct cnthread_cacheline *cnline);
+// dummy value
+static struct vm_area_struct dummy_vma;
+
+int cnthread_worker_handler(void *data);
+int cnthread_main_handler(void *data);
+static int check_inval_req_list_and_try(int from_inv, struct cnthread_inv_msg_ctx *inv_ctx, struct cnthread_cacheline *cnline, int flag);
 #ifndef MIND_USE_TSO
 static void _cnthread_send_inval_ack(u16 tgid, unsigned long vaddr, char *inval_buf);
 #endif
@@ -222,18 +235,79 @@ static void __always_inline add_cacheline_to_free_list(struct cnthread_cacheline
     spin_unlock(&free_cacheline_put_lock);
 }
 
+
+static void cnthread_initial_task_queues(void)
+{
+    int i = 0;
+    for (i = 0; i < CNTHREAD_TASK_QUEUE_NUM; i++)
+    {
+        // manual init
+        INIT_LIST_HEAD(&cnthread_task_queues[i]);
+        spin_lock_init(&cnthread_task_queue_locks[i]);
+    }
+}
+
+void cnthread_enqueue_task(unsigned int priority, struct cnthread_task_desc* task_desc)
+{
+    if (unlikely(priority >= CNTHREAD_TASK_QUEUE_NUM))
+    {
+        priority = CNTHREAD_TASK_QUEUE_NUM - 1;  // the lowest
+    }
+    spin_lock(&cnthread_task_queue_locks[priority]);
+    list_add(&task_desc->node, &cnthread_task_queues[priority]);
+    spin_unlock(&cnthread_task_queue_locks[priority]);
+}
+
+static __always_inline void cnthread_enqueue_task_retry(unsigned int priority, struct cnthread_task_desc* task_desc)
+{
+    if (unlikely(priority >= CNTHREAD_TASK_QUEUE_NUM))
+    {
+        priority = CNTHREAD_TASK_QUEUE_NUM - 1;  // the lowest
+    }
+    spin_lock(&cnthread_task_queue_locks[priority]);
+    list_add(&task_desc->node, cnthread_task_queues[priority].prev->prev);
+    spin_unlock(&cnthread_task_queue_locks[priority]);
+}
+
+static __always_inline struct cnthread_task_desc* dequeue_task(unsigned int priority)
+{
+    struct cnthread_task_desc* task_desc = NULL;
+    if (unlikely(priority >= CNTHREAD_TASK_QUEUE_NUM))
+    {
+        priority = CNTHREAD_TASK_QUEUE_NUM - 1;  // the lowest
+    }
+    // Check without lock (no need to be accurate, we will retry)
+    if (list_empty(&cnthread_task_queues[priority]))
+    {
+        return NULL;
+    }
+    // Check with lock
+    spin_lock(&cnthread_task_queue_locks[priority]);
+    if (list_empty(&cnthread_task_queues[priority]))
+    {
+        spin_unlock(&cnthread_task_queue_locks[priority]);
+        return NULL;
+    }
+    task_desc = (struct cnthread_task_desc *)container_of(cnthread_task_queues[priority].prev,
+                                                          struct cnthread_task_desc, node);
+    list_del(&task_desc->node);
+    spin_unlock(&cnthread_task_queue_locks[priority]);
+    return task_desc;
+}
+
 spinlock_t *get_per_core_lock(int cid)
 {
     return &cn_fh_per_core_lock[cid];
 }
 EXPORT_SYMBOL(get_per_core_lock);
 
+static struct cnthread_handler_data pfet_timer_data;
 void disagg_cn_thread_init(void)
 {
     // unsigned long pfn;
     struct page *page = NULL, *first_page = NULL, *last_page = NULL;
     long i = 0, j = 0;
-    struct cnthread_handler_data *data = NULL;
+    struct cnthread_handler_data *data[CNTHREAD_WORKER_NUMBER + 1] = {0};
     spin_lock_init(&cnthread_lock);
     spin_lock_init(&free_cacheline_put_lock);
     spin_lock_init(&free_cacheline_get_lock);
@@ -244,7 +318,8 @@ void disagg_cn_thread_init(void)
     spin_lock_init(&cnthread_evict_range_lock);
     spin_lock_init(&cnthread_inval_ack_lock);
     spin_lock_init(&cnthread_inval_buf_write_lock);
-    spin_lock_init(&cnthread_inval_req_list_lock);
+    // spin_lock_init(&cnthread_inval_req_list_lock);
+    // spin_lock_init(&cnthread_async_req_list_lock);
     spin_lock_init(&free_page_put_lock);
     spin_lock_init(&free_page_get_lock);
     __cn_handler_init_phase = 0;
@@ -254,11 +329,17 @@ void disagg_cn_thread_init(void)
     atomic_set(&cn_free_cacheline_counter, 0);
     atomic_long_set(&cn_total_eviction_counter, 0);
     atomic_set(&cnthread_inv_req_counter, 0);
+    atomic_set(&cnthread_async_req_counter, 0);
     atomic_set(&cnthread_buf_head_inv_splitter, 0);
     atomic_set(&cnthread_pgfault_helper_idx, 0);
 
     hash_init(lru_list_hashtable);
     hash_init(cn_cache_waiting_list);
+
+    cnthread_initial_task_queues();
+    init_pgfault_prefetch();
+    prealloc_kernel_shared_mem();
+    memset(&dummy_vma, 0, sizeof(dummy_vma));
 
     for (i = 0; i < DISAGG_NUM_CPU_CORE_IN_COMPUTING_BLADE; i++)
     {
@@ -277,13 +358,17 @@ void disagg_cn_thread_init(void)
         spin_lock_init(&cnthread_pgfault_helper_lock[i]);
     }
 
-    data = kzalloc(sizeof(*data), GFP_KERNEL);
-    if (!data)
+    for (i = 0; i < CNTHREAD_WORKER_NUMBER + 1; i++)
     {
-        pr_err("Cannot start cnthread handler daemon!\n");
+        data[i] = kzalloc(sizeof(*data[i]), GFP_KERNEL);
+        if (!data[i])
+        {
+            pr_err("Cannot start cnthread handler daemon!\n");
+        }
+        data[i]->init_stage = &__cn_handler_init_phase;
+        data[i]->pin_core_id = LAST_HANDLER_CPU - i;    // starting from the last cpu core
+        data[i]->worker_id = i;
     }
-
-    data->init_stage = &__cn_handler_init_phase;
     smp_wmb();
 
     // Initialize cache regions (=cacheline structures)
@@ -328,8 +413,33 @@ void disagg_cn_thread_init(void)
 
     init_test_program_thread_cnt();
 
-    kthread_run((void *)cnthread_handler, (void *)data, "disagg_evictd");
-    kthread_run((void *)cache_ack_handler, (void *)data, "disagg_invald");
+    // Start kernel handlers
+    kthread_run((void *)cnthread_main_handler, (void *)data[0], "disagg_main");
+    if (CNTHREAD_WORKER_NUMBER >= (DISAGG_NUM_CPU_CORE_IN_COMPUTING_BLADE / 2))
+    {
+        pr_warn("Disagg_Cached: not enough cores [%d] | num workers [%d]\n",
+                DISAGG_NUM_CPU_CORE_IN_COMPUTING_BLADE, CNTHREAD_WORKER_NUMBER);
+    }
+    for (i = 1; i < min(CNTHREAD_WORKER_NUMBER, DISAGG_NUM_CPU_CORE_IN_COMPUTING_BLADE / 2) + 1; i++)
+        kthread_run((void *)cnthread_worker_handler, (void *)data[i], "disagg_worker_%d", (int)i);
+
+    // Start prefetcher timer handler
+    pfet_timer_data.init_stage = &__cn_handler_init_phase;
+    pfet_timer_data.pin_core_id = 0; // not used
+    pfet_timer_data.worker_id= 0; // not used
+    pfet_timer_data.stat = NULL;
+    kthread_run((void *)pfet_timer_handler, (void *)&pfet_timer_data, "disagg_pfet_timer");
+
+    // Clean up unused data structure
+    for (i = min(CNTHREAD_WORKER_NUMBER, DISAGG_NUM_CPU_CORE_IN_COMPUTING_BLADE / 2) + 1;
+         i < CNTHREAD_WORKER_NUMBER + 1; i++)
+    {
+        if (data[i])
+        {
+            kfree(data[i]);
+            data[i] = NULL;
+        }
+    }
 }
 
 static int pin_current_thread_to_cpu(int cpu)
@@ -523,9 +633,9 @@ retry_get_free_page:
     if (unlikely(list_empty(&cn_free_cacheline_list) || list_empty(&cn_free_page_list)))
     {
         // cnthread_out_of_cache();    // this will kill itself
-        printk(KERN_WARNING "Out of DRAM software cache!! (free page: %d [%d], regions: %d[%d])\n",
-               atomic_read(&cn_free_page_counter), list_empty(&cn_free_cacheline_list), 
-               atomic_read(&cn_free_cacheline_counter), list_empty(&cn_free_page_list));
+        pr_info_ratelimited("Out of DRAM software cache!! (free page: %d [%d], regions: %d[%d])\n",
+                            atomic_read(&cn_free_page_counter), list_empty(&cn_free_page_list),
+                            atomic_read(&cn_free_cacheline_counter), list_empty(&cn_free_cacheline_list));
         spin_unlock(&free_cacheline_get_lock);
         spin_unlock(&hash_list_lock);
         spin_unlock(&cnthread_lock);
@@ -606,9 +716,9 @@ retry_get_free_cache:
     if (unlikely(list_empty(&cn_free_cacheline_list) || list_empty(&cn_free_page_list)))
     {
         // cnthread_out_of_cache();    // this will kill itself
-        printk(KERN_WARNING "Out of DRAM software cache!! (free page: %d [%d], regions: %d[%d])\n",
-               atomic_read(&cn_free_page_counter), list_empty(&cn_free_cacheline_list), 
-               atomic_read(&cn_free_cacheline_counter), list_empty(&cn_free_page_list));
+        pr_info_ratelimited("Out of DRAM software cache!! (free page: %d [%d], regions: %d[%d])\n",
+                            atomic_read(&cn_free_page_counter), list_empty(&cn_free_page_list),
+                            atomic_read(&cn_free_cacheline_counter), list_empty(&cn_free_cacheline_list));
         spin_unlock(&free_cacheline_get_lock);
         spin_unlock(&hash_list_lock);
         spin_unlock(&cnthread_lock);
@@ -691,7 +801,7 @@ inline int cnthread_add_pte_to_list_with_cnreq(
     }
 
     cnreq->pte_ptr = pte;
-    cnreq->vma = vma;
+    cnreq->vma = vma ? vma : &dummy_vma;
     smp_wmb();
     atomic_set(&cnreq->is_used, IS_PAGE_USED);
     return 0;
@@ -719,6 +829,7 @@ DEFINE_PROFILE_POINT(CN_update_roce_inv_req_evt)
 DEFINE_PROFILE_POINT(CN_update_roce_inv_req_inv)
 DEFINE_PROFILE_POINT(CN_update_roce_inv_req_prmpt)
 DEFINE_PROFILE_POINT(CN_update_roce_inv_queue)
+DEFINE_PROFILE_POINT(CN_update_roce_async_inv_queue)
 DEFINE_PROFILE_POINT(CN_update_roce_inv_lock)
 DEFINE_PROFILE_POINT(CN_update_roce_inv_send)
 DEFINE_PROFILE_POINT(CN_update_roce_inv_req)
@@ -945,15 +1056,21 @@ void cancel_waiting_for_nack(struct cache_waiting_node *w_node)
 static unsigned int error_cnt = 0;
 static int do_handle_ack(struct cache_waiting_node *w_node)
 {
+    PROFILE_POINT_TIME(FH_wait_ack_handler)
+    // initialize and parse data
     char *buf = w_node->ack_buf;
     u64 fva = parse_vaddr(buf);
     u32 rkey = parse_rkey(buf);
     u16 pid = (unsigned int)(fva >> 48);
     u64 vaddr = fva & (~MN_VA_PID_BIT_MASK);            // Pure virtual address (48bits)
     u32 state = rkey & CACHELINE_ROCE_RKEY_STATE_MASK;
-    PROFILE_POINT_TIME(FH_wait_ack_handler)
-    PROFILE_START(FH_wait_ack_handler);
+    if (pid == DISAGG_KERN_TGID)
+    {
+        vaddr |= MN_VA_PID_BIT_MASK;  // kernel's virtual address starts from 0xffff
+    }
 
+    // start checking ACK
+    PROFILE_START(FH_wait_ack_handler);
     if (rkey & CACHELINE_ROCE_RKEY_NACK_MASK) // If NACK is set
     {
         u16 r_state = 0, r_sharer = 0, r_size = 0, r_lock = 0, r_cnt = 0;
@@ -1109,8 +1226,11 @@ inline int wait_until_counter(struct cache_waiting_node *node, spinlock_t *pte_l
         if (unlikely(jiffies_to_msecs(jiffies - start_time) >= (unsigned long)(DISAGG_NET_ACK_TIMEOUT_IN_MS)))
         {
             u16 state = 0, sharer = 0;
-            send_cache_dir_check(node->tgid, node->addr & PAGE_MASK,
-                                 &state, &sharer, CN_SWITCH_REG_SYNC_NONE); // pull state before sending something
+            // send_cache_dir_check(node->tgid, node->addr & PAGE_MASK,
+            //                      &state, &sharer, CN_SWITCH_REG_SYNC_NONE); // pull state before sending something
+            u16 dir_size, dir_lock, inv_cnt;
+            send_cache_dir_full_always_check(node->tgid, node->addr & PAGE_MASK, &state, &sharer, 
+                                             &dir_size, &dir_lock, &inv_cnt, CN_SWITCH_REG_SYNC_NONE);
             printk(KERN_WARNING "ERROR: Cannot receive ACK/NACK - cpu :%d, tgid: %u, addr: 0x%lx, ack_cnt: %d, tar_cnt: %d, timeout (%u ms) / state: 0x%x, sharer: 0x%x\n",
                    smp_processor_id(), node->tgid, node->addr,
                    atomic_read(&node->ack_counter), atomic_read(&node->target_counter),
@@ -1234,7 +1354,6 @@ DEFINE_PROFILE_POINT(cnthread_evict_range)
 DEFINE_PROFILE_POINT(cnthread_evict_range_flush)
 DEFINE_PROFILE_POINT(cnthread_evict_range_remove)
 DEFINE_PROFILE_POINT(cnthread_evict_range_page)
-
 // check victim, pte, pte_lock, vma and make pte read-only if it is presented and writable
 static //__always_inline
 struct cnthread_inval_pte 
@@ -1278,7 +1397,7 @@ __cnthread_check_and_make_read_only(struct cnthread_req *victim, unsigned long a
                  (unsigned long)pte, (unsigned long)victim->pte_ptr);
     }
 
-    if (likely(victim->vma))
+    if (likely(victim->vma || is_kshmem_address(addr)))
     {
         // Let's rely on pagefault lock which is per page
         spin_lock(pte_lock);
@@ -1554,18 +1673,18 @@ static int ___cnthread_evict_one(struct cnthread_req *victim, unsigned long addr
         PROFILE_START(cnthread_evict_one_rdma);
         if (need_push_back || inv_ctx->is_target_data)
         {
-            int cpu_id = (2 * DISAGG_NUM_CPU_CORE_IN_COMPUTING_BLADE) + get_cpu();
-#ifdef CNTHREAD_COPY_FOR_INVALIDATE
-            memcpy(get_dummy_page_buf_addr(cpu_id), victim->kmap, PAGE_SIZE);
-            if (unlikely(cn_copy_page_data_to_mn(cnline->tgid, cnline->mm, addr,
-                                                 NULL, inv_ctx->is_target_data ? CN_TARGET_PAGE : CN_OTHER_PAGE,
-                                                 req_qp, (void*)get_dummy_page_dma_addr(cpu_id))))
-#else
-            (void)cpu_id;   // make compiler happy
+//             int cpu_id = (2 * DISAGG_NUM_CPU_CORE_IN_COMPUTING_BLADE) + get_cpu();
+// #ifdef CNTHREAD_COPY_FOR_INVALIDATE
+//             memcpy(get_dummy_page_buf_addr(cpu_id), victim->kmap, PAGE_SIZE);
+//             if (unlikely(cn_copy_page_data_to_mn(cnline->tgid, cnline->mm, addr,
+//                                                  NULL, inv_ctx->is_target_data ? CN_TARGET_PAGE : CN_OTHER_PAGE,
+//                                                  req_qp, (void*)get_dummy_page_dma_addr(cpu_id))))
+// #else
+//             (void)cpu_id;   // make compiler happy
             if (unlikely(cn_copy_page_data_to_mn(cnline->tgid, cnline->mm, addr,
                                                  pte, inv_ctx->is_target_data ? CN_TARGET_PAGE : CN_OTHER_PAGE, 
                                                  req_qp, (void *)victim->dma_addr)))
-#endif
+// #endif
             {
                 pr_warn("CNTHREAD - Cannot send data to MN...\n");
                 skip_eviction = -1;
@@ -1789,7 +1908,7 @@ int is_owner_address(unsigned int tgid, unsigned long addr)
         return 0;
 }
 
-static char *dummy_page_buf[DISAGG_NUM_CPU_CORE_IN_COMPUTING_BLADE * 3] = {NULL};
+static char *dummy_page_buf[DISAGG_NUM_CPU_CORE_IN_COMPUTING_BLADE * 3] = {NULL};   // 3x: | PageFault | Fin ack | Inval ack
 static char *dummy_inv_page_buf = NULL;
 static unsigned long dummy_page_dma_addr[DISAGG_NUM_CPU_CORE_IN_COMPUTING_BLADE * 3] = {0};
 static unsigned long dummy_inv_page_dma_addr = 0;
@@ -1804,8 +1923,12 @@ static int cn_send_inval_ack_roce(u16 tgid, unsigned long addr, void* inval_buf)
     payload.tgid = tgid;
     payload.address = addr;
     payload.data_size = CACHELINE_ROCE_HEADER_LENGTH;
-    payload.data = (void*)get_dummy_inv_page_dma_addr();
-    memcpy(dummy_inv_page_buf, inval_buf, CACHELINE_ROCE_HEADER_LENGTH);
+    // FIX: use dummy_page_buf
+    payload.data = (void *)get_dummy_page_dma_addr((2 * DISAGG_NUM_CPU_CORE_IN_COMPUTING_BLADE) + cpu_id);
+    memcpy((void *)get_dummy_page_buf_addr((2 * DISAGG_NUM_CPU_CORE_IN_COMPUTING_BLADE) + cpu_id),
+           inval_buf, CACHELINE_ROCE_HEADER_LENGTH);
+    // payload.data = (void*)get_dummy_inv_page_dma_addr();
+    // memcpy(dummy_inv_page_buf, inval_buf, CACHELINE_ROCE_HEADER_LENGTH);
     barrier();
     ret = send_msg_to_memory_rdma(DISSAGG_ROCE_INVAL_ACK, &payload, CACHELINE_ROCE_HEADER_LENGTH,
                                   &reply, sizeof(reply));
@@ -1865,22 +1988,20 @@ static int cnthread_find_and_evict(unsigned int tgid, unsigned long addr, unsign
     unsigned long start_addr = (addr / dir_size) * dir_size;
     unsigned long cache_addr = addr & CNTHREAD_CACHLINE_MASK;
     unsigned long end_addr = start_addr + dir_size;
-    unsigned long tmp_addr, next_inval_addr;
+    unsigned long tmp_addr;
     struct cnthread_req *victim = NULL;
     struct cnthread_cacheline *cnline = NULL;
     int removed = 0;
-    int cnt = 0, wcnt = 0, ret = 0, rpage_idx=0, range_inv = 0;
+    int cnt = 0, wcnt = 0, ret = 0;
     struct cache_waiting_node *w_node = NULL;
     unsigned long start, start_ack, end, proc_time, start_lock, end_lock;
     u16 state = 0, sharer = 0, r_size = 0, r_lock = 0, r_cnt = 0;
-    int _cnthread_is_lock[CNTHREAD_CACHELINE_SIZE_IN_PAGES] = {0};
     PROFILE_POINT_TIME(CN_inv_target_data)
     PROFILE_POINT_TIME(CN_inv_total)
     PROFILE_POINT_TIME(CN_inv_total_dum)
     PROFILE_POINT_TIME(CN_inv_total_prmpt)
     PROFILE_POINT_TIME(CN_inv_target_data_prmpt)
     PROFILE_POINT_TIME(CN_inv_dummy_data_prmpt)
-    PROFILE_POINT_TIME(CN_inv_other_data_prmpt)
     // make compiler happy
     (void)wcnt;
     addr &= PAGE_MASK; // may not be needed
@@ -1899,6 +2020,7 @@ recheck:
     cnt = 0;
     if (inv_ctx)
     {
+        // If invalidation handler already locked this
         if (inv_ctx->cnline_ptr && inv_ctx->is_locked)
         {
             cnline = inv_ctx->cnline_ptr;
@@ -1927,7 +2049,7 @@ recheck:
                 // BUG();  // it can occurs when the program terminates by signal (EXIT syscall during invalidation)
                 if ((is_invalid != TRY_INVALIDATION) && !data_required)
                 {   // simply return and try next
-                    return 0;
+                    return CNTHREAD_NO_ASYNC_NEEDED;
                 }
                 udelay(500);
                 goto recheck; // We need lock to send required target data
@@ -1939,20 +2061,20 @@ recheck:
             {
                 if (atomic_read(&cnline->used_page) <= 0)
                     is_invalid = EVICT_BUT_RETRYING;    // Cleaning up routine
-                else
-                    spin_unlock(&cnline->evict_lock);   // Back to pre-eviction routine
+		        else
+                   spin_unlock(&cnline->evict_lock);   // Back to pre-eviction routine
             }
         }
 hold_ongoing_lock:
         if (!spin_trylock(&cnline->on_going_lock))
         {
-            if (is_invalid && spin_is_locked(&cnline->evict_lock))
+	        if (is_invalid && spin_is_locked(&cnline->evict_lock))
                 spin_unlock(&cnline->evict_lock);
             spin_unlock(&hash_list_lock);
             spin_unlock(&cnthread_lock);
             if (!is_invalid && !data_required)
             {   // simply return and try next
-                return 0;
+                return CNTHREAD_NO_ASYNC_NEEDED;
             }
             pr_info_ratelimited("Cacheline::Already being evicted-tgid: %u, addr: 0x%lx [0x%lx - 0x%lx], retry: %d\n",
                                 tgid, addr, start_addr, end_addr, ret);
@@ -2016,7 +2138,7 @@ hold_ongoing_lock:
         spin_unlock(&hash_list_lock);
         spin_unlock(&cnthread_lock);
         PROFILE_LEAVE(CN_inv_total_dum);
-        return 0;
+        return CNTHREAD_NO_ASYNC_NEEDED;
     }
     spin_unlock(&hash_list_lock);
     spin_unlock(&cnthread_lock);
@@ -2038,8 +2160,8 @@ hold_ongoing_lock:
         }
     }
     smp_wmb();
-    pr_cache("Canceled waiting node [found: %d] - tgid: %u, addr: 0x%lx - 0x%lx, inval: %d, Dreq: %d, Ddel:%d, wCnt: %d, rwCnt: %ld\n",
-                cnt, tgid, start_addr, end_addr, is_invalid, data_required, remove_data, wcnt, atomic_long_read(&cnline->access_sem.count));
+    pr_cache("Canceled waiting node [found: %d] - tgid: %u, addr: 0x%lx - 0x%lx, inval: %d, Dreq: %d, Ddel:%d, wCnt: %d, rwCnt: %ld, CPU: %d\n",
+                cnt, tgid, start_addr, end_addr, is_invalid, data_required, remove_data, wcnt, atomic_long_read(&cnline->access_sem.count), smp_processor_id());
     start_lock = jiffies;
     victim = find_page_from_cacheline(cnline, addr);
     if (victim)
@@ -2115,9 +2237,11 @@ hold_ongoing_lock:
             inv_ctx->is_target_data = data_required;
             inv_ctx->remove_data = remove_data;
             inv_ctx->is_invalid = is_invalid;
+pr_cache("start ___cnthread_evict_one for addr: %lx CPU: %d\n", addr, smp_processor_id());
             ret = ___cnthread_evict_one(victim, addr, _threshold, _high_threshold,
                                         inv_ctx, inv_ack_buf, req_qp);
-            if (dummy_ctx)  //FIXME: unlikely?—eviction and termination
+pr_cache("done ___cnthread_evict_one for addr: %lx CPU: %d\n", addr, smp_processor_id());
+            if (dummy_ctx)  //unlikely?—eviction and termination
             {
                 kfree(inv_ctx);
                 inv_ctx = NULL;
@@ -2160,6 +2284,9 @@ send_target_dummy_data:
             pr_cache("Dummy data sent-tgid(w/ cacheline): %u, addr: 0x%lx, inval: %d, Dreq: %d, Ddel:%d\n",
                         tgid, addr, is_invalid, data_required, remove_data);
             udelay(10); // To avoid reordered data - ACK (it must not be in this order: ACK - data)
+        }else{
+            pr_cache("No data and no dummy needed: %u, addr: 0x%lx, inval: %d, Dreq: %d, Ddel:%d\n",
+                     tgid, addr, is_invalid, data_required, remove_data);
         }
     }
     barrier();
@@ -2174,8 +2301,122 @@ send_target_dummy_data:
 #endif
         }
     }
-    pr_cache("Target/first page invalidated - tgid: %u, addr: 0x%lx, inval: %d, Dreq: %d, Ddel:%d\n",
-             tgid, addr, is_invalid, data_required, remove_data);
+    pr_cache("Target/first page invalidated - tgid: %u, addr: 0x%lx, inval: %d, Dreq: %d, Ddel:%d, CPU:%d\n",
+             tgid, addr, is_invalid, data_required, remove_data, smp_processor_id());
+    //return CNTHREAD_INVALIDATION_SUCCESS;
+    if (is_invalid)
+    {
+        if (from_preampt)
+            PROFILE_LEAVE(CN_inv_total_prmpt);
+        else
+            PROFILE_LEAVE(CN_inv_total);
+    }
+    pr_cache("[Middle] of evcit-tgid(w/ cacheline): %u, addr: 0x%lx, inval: %d, Dreq: %d, Ddel: %d, Removed: %d, Remaining: %d\n",
+                tgid, addr, is_invalid, data_required, remove_data, removed, atomic_read(&cnline->used_page));
+    // Page was indeed invalid and return success
+    if (is_invalid == EVICT_BUT_RETRYING)
+        return CNTHREAD_EVICTION_DATAPUSH;
+    else
+        return CNTHREAD_INVALIDATION_SUCCESS;
+
+    // Put cnline back on the list and try eviction again
+out_evict:
+    // Put the cnline back to the list and we will try again next time
+    // (only possible for eviction)
+    pr_cache("[Retry]evcit-tgid(w/ cacheline): %u, addr: 0x%lx, inval: %d, Dreq: %d, Ddel: %d, Removed: %d, Remaining: %d\n",
+                tgid, addr, is_invalid, data_required, remove_data, removed, atomic_read(&cnline->used_page));
+
+    spin_lock(&cnthread_lock);
+    if (is_invalid && spin_is_locked(&cnline->evict_lock))
+        spin_unlock(&cnline->evict_lock);
+    spin_unlock(&cnline->on_going_lock);
+    list_add(&cnline->node, &cn_handler_lru_list);
+    atomic_inc(&cnthread_list_counter);
+    spin_unlock(&cnthread_lock);
+    return CNTHREAD_SYNC_PART_FAILED;
+}
+
+static int cnthread_find_and_evict_remaining(unsigned int tgid, unsigned long addr, unsigned long dir_size,
+                                             int is_invalid, int data_required,
+                                             int remove_data, char *inv_ack_buf,
+                                             struct cnthread_inv_msg_ctx *inv_ctx, int from_preampt)
+{
+    unsigned long start_addr = (addr / dir_size) * dir_size;
+    unsigned long cache_addr = addr & CNTHREAD_CACHLINE_MASK;
+    unsigned long end_addr = start_addr + dir_size;
+    unsigned long tmp_addr, next_inval_addr;
+    struct cnthread_req *victim = NULL;
+    struct cnthread_cacheline *cnline = NULL;
+    int cnt = 0, wcnt = 0, ret = 0, rpage_idx=0, range_inv = 0;
+    struct cache_waiting_node *w_node = NULL;
+    unsigned long start, start_ack, end, proc_time, start_lock, end_lock;
+    u16 state = 0, sharer = 0, r_size = 0, r_lock = 0, r_cnt = 0;
+    int _cnthread_is_lock[CNTHREAD_CACHELINE_SIZE_IN_PAGES] = {0};
+    int _cnthread_is_populated[CNTHREAD_CACHELINE_SIZE_IN_PAGES] = {0};
+
+    PROFILE_POINT_TIME(CN_inv_other_data_prmpt)
+    // make compiler happy
+    (void)wcnt;
+    addr &= PAGE_MASK; // may not be needed
+    // send_cache_dir_check(tgid, addr & CNTHREAD_CACHLINE_MASK,
+    //                      &state, &sharer, CN_SWITCH_REG_SYNC_NONE); // pull state from the switch (**high overhead**)
+    pr_cache("Eviction triggered(async)-tgid: %u, addr: 0x%lx [0x%lx - 0x%lx], inval: %d, Dreq: %d, Ddel:%d / state: 0x%x, sharer: 0x%x\n",
+           tgid, addr, start_addr, end_addr, is_invalid, data_required, remove_data, state, sharer);
+    // 1) Find target node in hash table
+    start = sched_clock();
+// recheck:
+    cnt = 0;
+    if (inv_ctx)
+    {
+        if (inv_ctx->cnline_ptr && inv_ctx->is_locked)
+        {
+            cnline = inv_ctx->cnline_ptr;
+            cnline->ownership = 0;
+        }
+        else
+        {
+            pr_info("Error: cnline[0x%lx] is_locked[%d]\n",
+                    (unsigned long)inv_ctx->cnline_ptr, inv_ctx->is_locked);
+            BUG();
+        }
+    }
+    else
+    {
+        // for evictions, we do not have inv_ctx
+        spin_lock(&cnthread_lock);
+        spin_lock(&hash_list_lock);
+        cnline = find_cacheline_no_lock(tgid, cache_addr);
+        // 2) Check status of the target cacheline (=cache region of cache directory)
+        spin_unlock(&cnthread_lock);
+        spin_unlock(&hash_list_lock);
+        if (!cnline)
+            return 0;   // can be caused by simulatenous invalidations/evictions
+        pr_info_ratelimited("Cacheline:: Eviction routine-tgid: %u, addr: 0x%lx [0x%lx - 0x%lx], retry: %d, inval: %d\n",
+                            tgid, addr, start_addr, end_addr, ret, is_invalid);
+    }
+
+    // We already have this lock
+    if (spin_trylock(&cnline->on_going_lock))
+    {
+        BUG();  // we must fail, because we already hold it
+    }
+
+// hold_ongoing_lock:
+//     if (!spin_trylock(&cnline->on_going_lock))
+//     {
+//         if (is_invalid && spin_is_locked(&cnline->evict_lock))
+//             spin_unlock(&cnline->evict_lock);
+//         spin_unlock(&hash_list_lock);
+//         spin_unlock(&cnthread_lock);
+//         if (!is_invalid && !data_required)
+//         {   // simply return and try next
+//             return 0;
+//         }
+//         pr_info_ratelimited("Cacheline::Already being evicted-tgid: %u, addr: 0x%lx [0x%lx - 0x%lx], retry: %d\n",
+//                             tgid, addr, start_addr, end_addr, ret);
+//         udelay(500);
+//         goto recheck; //we need this lock to send required target data
+//     }
 
     // 4) Invalidate remaining pages in the same cache directory
     rpage_idx = -1; range_inv = 0;
@@ -2199,6 +2440,7 @@ send_target_dummy_data:
         {
             start_lock = end_lock = 0;
             w_node = NULL;
+            _cnthread_is_populated[rpage_idx] = 1;
             if (!spin_trylock(&victim->pgfault_lock))
             {
                 // Under data fetch (=by the page fault handler)
@@ -2250,8 +2492,8 @@ send_target_dummy_data:
         }
     }
     // For any remaining pages
-    pr_cache("Try to evict remaining pages[%d] - tgid: %u, addr: 0x%lx - 0x%lx, inval: %d, Dreq: %d, Ddel:%d\n",
-             range_inv, tgid, next_inval_addr, tmp_addr, is_invalid, data_required, remove_data);
+    pr_cache("Try to evict remaining pages[%d] - tgid: %u, addr: 0x%lx - 0x%lx, inval: %d, Dreq: %d, Ddel:%d, CPU: %d\n",
+             range_inv, tgid, next_inval_addr, tmp_addr, is_invalid, data_required, remove_data, smp_processor_id());
     if (!range_inv) // It if was successful
     {
         PROFILE_START(CN_inv_other_data_prmpt);
@@ -2280,12 +2522,12 @@ send_target_dummy_data:
 #ifdef PRINT_CACHE_COHERENCE
     if (is_invalid && data_required)
     {
-        pr_cache("After Data sent-tgid(w/ cacheline): %u, addr: 0x%lx, inval: %d, Dreq: %d, Ddel: %d / state: 0x%x, sharer: 0x%x\n",
+        pr_cache("After Data sent-tgid(w/ cacheline): %u, addr: 0x%lx, inval: %d, Dreq: %d, Ddel: %d / state: 0x%x, sharer: 0x%x, CPU: %d\n",
             tgid, addr, is_invalid, data_required, remove_data,
-            state, sharer);
+            state, sharer, smp_processor_id());
     }
 #endif
-    // Send final data ack - invalidated or evicted whole cacheline
+    // Send final data ack - we invalidated or evicted whole cacheline
     if (is_invalid || atomic_read(&cnline->used_page) <= 0)
     {
         if (is_invalid)
@@ -2297,9 +2539,17 @@ send_target_dummy_data:
             {
                 cnthread_send_finish_ack(tgid, addr & PAGE_MASK, &send_ctx, 1);
             }else{
-                // send ack for all the evicted pages, since we do not know exact cache region size now
+                // PATCH: we will not send message massively here. 
+                //        Instead we will wait for dummy invalidation requests
+                //        so that we can clean up cache directory later.
+                // send ack for all the evicted pages (we do not know exact cache region size now)
+                rpage_idx = -1;
                 for (tmp_addr = start_addr; tmp_addr < end_addr; tmp_addr += PAGE_SIZE)
-                    cnthread_send_finish_ack(tgid, tmp_addr, &send_ctx, 0);
+                {
+                    rpage_idx ++;
+                    if (_cnthread_is_populated[rpage_idx])
+                        cnthread_send_finish_ack(tgid, tmp_addr, &send_ctx, 0);
+                }
             }
             end = jiffies;
             proc_time = (end > start) ? jiffies_to_usecs(end - start) : 0;
@@ -2311,10 +2561,10 @@ send_target_dummy_data:
                 //                      &state, &sharer, CN_SWITCH_REG_SYNC_NONE); // pull state from the switch (**high overhead**)
                 send_cache_dir_full_check(tgid, start_addr,
                                         &state, &sharer, &r_size, &r_lock, &r_cnt, CN_SWITCH_REG_SYNC_NONE);
-                printk(KERN_WARNING "Fin2 Ack sent-tgid(w/ cacheline): %u, addr: 0x%lx (0x%lx), inval: %d, Dreq: %d, Ddel: %d, Time: %lu us (ack: %u us)\n",
+                printk(KERN_WARNING "Fin2 Ack sent-tgid(w/ cacheline): %u, addr: 0x%lx (0x%lx), inval: %d, Dreq: %d, Ddel: %d, Time: %lu us (ack: %u us), CPU: %d\n",
                         tgid, addr, start_addr, is_invalid, data_required, remove_data,
-                        proc_time, (end >= start_ack) ? jiffies_to_usecs(end - start_ack) : 0);
-                printk(KERN_WARNING "Fin2 Reg: state: 0x%x, sharer: 0x%x, size: %u, lock: %u, cnt: %u\n", state, sharer, r_size, r_lock, r_cnt);
+                        proc_time, (end >= start_ack) ? jiffies_to_usecs(end - start_ack) : 0, smp_processor_id());
+                printk(KERN_WARNING "Fin2 Reg: state: 0x%x, sharer: 0x%x, size: %u, lock: %u, cnt: %u, CPU: %d\n", state, sharer, r_size, r_lock, r_cnt, smp_processor_id());
             }
         }else{
             // First eviction pass but no data -- rollback cnline structure, exit and try again
@@ -2322,12 +2572,29 @@ send_target_dummy_data:
         }
     }
 
-    if (((is_invalid == EVICT_BUT_RETRYING) || (is_invalid == EVICT_FORCED))   // only when we removed all the pages in this 2MB cacheline
-        && remove_data && (atomic_read(&cnline->used_page) <= 0))
+    // Already handled inside sync invalidation part
+    // if (!ret)    // retry > 0: already removed the node, so skip
+    // {
+    //     pr_cache("Cacheline::Remove from list-tgid: %u, addr: 0x%lx [0x%lx - 0x%lx], retry: %d\n",
+    //                 tgid, addr, start_addr, end_addr, ret);
+    //     list_del(&(cnline->node));    // remove from the LRU list
+    //     pr_cache("cnline->node: 0x%lx\n", (unsigned long)&cnline->node);
+    //     atomic_dec(&cnthread_list_counter);
+    //     pr_cache("cnthread_list_counter: %d\n", atomic_read(&cnthread_list_counter));
+    // }
+
+    pr_cache("End evcit-tgid(w/ cacheline): %u, addr: 0x%lx, inval: %d, Dreq: %d, Ddel: %d, Remaining: %d\n",
+             tgid, addr, is_invalid, data_required, remove_data, atomic_read(&cnline->used_page));
+
+    // if (((is_invalid == EVICT_BUT_RETRYING) || (is_invalid == EVICT_FORCED))   // only when we removed all the pages in this 2MB cacheline
+    if (is_invalid && remove_data && (atomic_read(&cnline->used_page) <= 0))
     {
         spin_lock(&hash_list_lock);
         hash_del(&cnline->hnode);
         smp_wmb();
+        if (is_invalid && spin_is_locked(&cnline->evict_lock))
+            spin_unlock(&cnline->evict_lock);
+        spin_unlock(&cnline->on_going_lock);
         add_cacheline_to_free_list(cnline); // clean and add to the free list
         spin_unlock(&hash_list_lock);
         // cnthread_print_cache_status();
@@ -2341,21 +2608,11 @@ out_evict:
         list_add(&cnline->node, &cn_handler_lru_list);
         atomic_inc(&cnthread_list_counter);
         spin_unlock(&cnthread_lock);
+        if (is_invalid && spin_is_locked(&cnline->evict_lock))
+            spin_unlock(&cnline->evict_lock);
+        spin_unlock(&cnline->on_going_lock);
     }
-    if (is_invalid && spin_is_locked(&cnline->evict_lock))
-        spin_unlock(&cnline->evict_lock);
-    spin_unlock(&cnline->on_going_lock);
-
-    if (is_invalid)
-    {
-        if (from_preampt)
-            PROFILE_LEAVE(CN_inv_total_prmpt);
-        else
-            PROFILE_LEAVE(CN_inv_total);
-    }
-    pr_cache("End evcit-tgid(w/ cacheline): %u, addr: 0x%lx, inval: %d, Dreq: %d, Ddel: %d, Removed: %d, Remaining: %d\n",
-             tgid, addr, is_invalid, data_required, remove_data, removed, atomic_read(&cnline->used_page));
-    return CNTHREAD_TRY_EVICTION_AGAIN;
+    return CNTHREAD_INVALIDATION_SUCCESS;
 }
 
 int cnthread_check_free_space(void)
@@ -2405,9 +2662,15 @@ int cnthread_evict_one(int threshold, int high_threshold)
 
     // Main eviction function
     // THIS SHOULD BE ALL PAGES IN A CACHELINE (=cache region with maximum size)
-    ret = cnthread_find_and_evict(tgid, addr, CNTHREAD_CACHELINE_SIZE_IN_PAGES * PAGE_SIZE,
+    ret = cnthread_find_and_evict(tgid, addr, CACHELINE_MAX_SIZE,
                                   0, 0, CNTHREAD_BATCH_IN_CACHELINE, NULL, NULL, 0);
-    if (ret == CNTHREAD_TRY_EVICTION_AGAIN)
+    if ((ret != CNTHREAD_SYNC_PART_FAILED) && (ret != CNTHREAD_NO_ASYNC_NEEDED))
+    {
+        cnthread_find_and_evict_remaining(tgid, addr, CACHELINE_MAX_SIZE,
+                                          ret == CNTHREAD_EVICTION_DATAPUSH ? EVICT_BUT_RETRYING : 0, 
+                                          0, CNTHREAD_BATCH_IN_CACHELINE, NULL, NULL, 0);
+    }
+    if (ret == CNTHREAD_INVALIDATION_SUCCESS)
     {
         // Here we print number before this eviction
         cur_cnt = (int)atomic_read(&cnthread_evict_counter);
@@ -2577,10 +2840,15 @@ restart_search:
             {
                 if (flush_data)
                 {
+                    int sync_ret = 0;
                     addr = cline->addr;
                     spin_unlock(&hash_list_lock);
                     spin_unlock(&cnthread_lock);
-                    cnthread_find_and_evict(tgid, addr, CACHELINE_MAX_SIZE, EVICT_FORCED, 0, (CACHELINE_MAX_SIZE/PAGE_SIZE), NULL, NULL, 0);
+                    sync_ret = cnthread_find_and_evict(tgid, addr, CACHELINE_MAX_SIZE, EVICT_FORCED, 0, (CACHELINE_MAX_SIZE/PAGE_SIZE), NULL, NULL, 0);
+                    if ((sync_ret != CNTHREAD_SYNC_PART_FAILED) && (sync_ret != CNTHREAD_NO_ASYNC_NEEDED))
+                    {
+                        cnthread_find_and_evict_remaining(tgid, addr, CACHELINE_MAX_SIZE, EVICT_FORCED, 0, (CACHELINE_MAX_SIZE/PAGE_SIZE), NULL, NULL, 0);
+                    }
                     goto restart_search;
                 }
                 else
@@ -2759,6 +3027,10 @@ static void inval_rdma_retrieve_base(struct cnthread_rdma_msg_ctx *ctx, unsigned
     ctx->ret = __be32_to_cpu(ctx->ret);
     ctx->pid = (unsigned int)(ctx->fva >> 48);
     ctx->vaddr = ctx->fva & (~MN_VA_PID_BIT_MASK); // Pure virtual address (48bits)
+    if (ctx->pid == DISAGG_KERN_TGID)
+    {
+        ctx->vaddr |= MN_VA_PID_BIT_MASK;  // kernel's virtual address starts from 0xffff
+    }
     ctx->state = ctx->ret & CACHELINE_ROCE_RKEY_STATE_MASK;
     pr_cache("[cRDMA] Buf[0x%lx] || FVA: 0x%llx => PID: %u, VA: 0x%llx || RKEY: 0x%x, IP: 0x%lx\n",
                 (unsigned long)rdma_buf, ctx->fva, ctx->pid, ctx->vaddr, ctx->ret, (unsigned long)ctx->ip_val);
@@ -2818,6 +3090,9 @@ static __always_inline void serve_inval_rdma_ack(unsigned char* rdma_buf, int ms
                     (unsigned int)rdma_ctx.state,  (unsigned int)rdma_ctx.sharer);
             if (rdma_ctx.state == CACHE_STATE_INV_ACK)
             { // ACK from other node
+                // pr_info("[ACK_NODE] Ack for Node: 0x%lx, PID: %u, VA: 0x%llx, State: %u, Sharer: 0x%x\n",
+                //         (unsigned long)w_node, rdma_ctx.pid, rdma_ctx.vaddr,
+                //         (unsigned int)rdma_ctx.state, (unsigned int)rdma_ctx.sharer);
                 increase_wait_counter(w_node);
             }
             else
@@ -2838,15 +3113,57 @@ static __always_inline void serve_inval_rdma_ack(unsigned char* rdma_buf, int ms
     }
 }
 
-static __always_inline int check_inval_req_list_and_try(int from_inv, struct cnthread_cacheline *cnline)
+// static __always_inline struct cnthread_inv_msg_ctx *check_sync_inv(void)
+// {
+//     struct cnthread_inv_msg_ctx *inv_ctx = NULL;
+//     // Check without lock (no need to be accurate, we will retry)
+//     if (list_empty(&cn_inval_req_list))
+//     {
+//         return NULL;
+//     }
+//     // Check with lock
+//     spin_lock(&cnthread_inval_req_list_lock);
+//     if(list_empty(&cn_inval_req_list))
+//     {
+//         spin_unlock(&cnthread_inval_req_list_lock);
+//         return NULL;
+//     }
+//     inv_ctx = (struct cnthread_inv_msg_ctx *)container_of(cn_inval_req_list.prev, struct cnthread_inv_msg_ctx, node);
+//     list_del(&inv_ctx->node);
+//     spin_unlock(&cnthread_inval_req_list_lock);
+//     return inv_ctx;
+// }
+
+// static __always_inline struct cnthread_inv_msg_ctx *check_async_inv(void)
+// {
+//     struct cnthread_inv_msg_ctx *inv_ctx = NULL;
+//     // Check without lock (no need to be accurate, we will retry)
+//     if (list_empty(&cn_async_req_list))
+//     {
+//         return -1;
+//     }
+//     // Check with lock
+//     spin_lock(&cnthread_async_req_list_lock);
+//     if (list_empty(&cn_async_req_list))
+//     {
+//         spin_unlock(&cnthread_async_req_list_lock);
+//         return -1;
+//     }
+//     inv_ctx = (struct cnthread_inv_msg_ctx *)container_of(cn_async_req_list.prev, struct cnthread_inv_msg_ctx, node);
+//     list_del(&inv_ctx->node);
+//     spin_unlock(&cnthread_async_req_list_lock);
+//     return inv_ctx;
+// }
+
+static __always_inline int check_inval_req_list_and_try(int from_inv, struct cnthread_inv_msg_ctx *inv_ctx, struct cnthread_cacheline *cnline, int is_async)
 {
     int res = 0;
-    struct cnthread_inv_msg_ctx *inv_ctx = NULL;
     struct cnthread_rdma_msg_ctx *rdma_ctx = NULL;
     PROFILE_POINT_TIME(CN_update_roce_inv_req_evt)
     PROFILE_POINT_TIME(CN_update_roce_inv_req_inv)
     PROFILE_POINT_TIME(CN_update_roce_inv_req_prmpt)
     PROFILE_POINT_TIME(CN_update_roce_inv_queue)
+    PROFILE_POINT_TIME(CN_update_roce_async_inv_queue)
     PROFILE_POINT_TIME(CN_latency_10us)
     PROFILE_POINT_TIME(CN_latency_50us)
     PROFILE_POINT_TIME(CN_latency_100us)
@@ -2854,39 +3171,53 @@ static __always_inline int check_inval_req_list_and_try(int from_inv, struct cnt
     PROFILE_POINT_TIME(CN_latency_500us)
     PROFILE_POINT_TIME(CN_latency_1000us)
 
-    // Check without lock (no need to be accurate, we will retry)
-    if (list_empty(&cn_inval_req_list))
-    {
-        return -1;
-    }
-
-    spin_lock(&cnthread_inval_req_list_lock);
-    if (list_empty(&cn_inval_req_list))
-    {
-        spin_unlock(&cnthread_inval_req_list_lock);
-        return -1;
-    }
-    inv_ctx = (struct cnthread_inv_msg_ctx *)container_of(cn_inval_req_list.prev, struct cnthread_inv_msg_ctx, node);
-    list_del(&inv_ctx->node);
-    spin_unlock(&cnthread_inval_req_list_lock);
+    // if (is_async == 0)
+    // {
+    //     inv_ctx = check_sync_inv();
+    // }
+    // else if (is_async == 1)
+    // {
+    //     inv_ctx = check_async_inv();
+    // }
 
     // Check lock
     if (inv_ctx)
     {
+        int ret = CNTHREAD_RET_NORMAL;
+
         rdma_ctx = &inv_ctx->rdma_ctx;
         res = check_and_hold_evict_lock(rdma_ctx->pid, rdma_ctx->vaddr, inv_ctx, cnline);
-        inv_ctx->is_locked = (res == RET_CNLINE_LOCKED) ? 1 : 0;
-        if (res != RET_CNLINE_NOT_LOCKED)   // locked or cnline not found
+        if (is_async == 1)
         {
-            int data_required;
+            if (res == RET_NO_CNLINE)
+            {
+                pr_warn_ratelimited("Cannot find cnline: 0x%lx\n", (unsigned long)rdma_ctx->vaddr);
+                // kfree(inv_ctx);
+                return CNTHREAD_RET_RELEASE;
+            }else{
+                res = RET_CNLINE_LOCKED;
+            }
+        }
+        inv_ctx->is_locked = (res == RET_CNLINE_LOCKED) ? 1 : 0;
+        if (res != RET_CNLINE_NOT_LOCKED) // locked or cnline not found
+        {
+            int data_required, inv_ret = 0;
             u32 inval_mod;
             int shared_inval, self_request;
             unsigned int dir_size;
-            volatile unsigned long debug_jiff = 0;
+            // volatile unsigned long debug_jiff = 0;
             int queue_length = 0;
             // Counters for invalidation queue
-            atomic_dec(&cnthread_inv_req_counter);  // do not need to be accurate and synchronized (in timing)
-            PROFILE_ADD_MEASUREMENT(CN_update_roce_inv_queue, (unsigned long)(sched_clock() - inv_ctx->last_update));
+            if (is_async == 0)
+            {
+                atomic_dec(&cnthread_inv_req_counter); // do not need to be accurate and synchronized (in timing)
+                PROFILE_ADD_MEASUREMENT(CN_update_roce_inv_queue, (unsigned long)(sched_clock() - inv_ctx->last_update));
+            }
+            if (is_async == 1)
+            {
+                atomic_dec(&cnthread_async_req_counter);
+                PROFILE_ADD_MEASUREMENT(CN_update_roce_async_inv_queue, (unsigned long)(sched_clock() - inv_ctx->last_update));
+            }
             inv_ctx->last_update = sched_clock();
             PROFILE_START(CN_update_roce_inv_req_evt);
             PROFILE_START(CN_update_roce_inv_req_inv);
@@ -2896,7 +3227,7 @@ static __always_inline int check_inval_req_list_and_try(int from_inv, struct cnt
             // Original QP used by the requester: right 8 bits, we assume that left 16 bits = 0
             inv_ctx->original_qp = (rdma_ctx->ret & CACHELINE_ROCE_RKEY_QP_MASK) >> CACHELINE_ROCE_RKEY_QP_SHIFT;
             create_invalidation_rdma_ack(inv_ctx->inval_buf, rdma_ctx->fva, rdma_ctx->ret, rdma_ctx->qp_val);
-            *((u32*)(&(inv_ctx->inval_buf[CACHELINE_ROCE_VOFFSET_TO_IP]))) = rdma_ctx->ip_val;
+            *((u32 *)(&(inv_ctx->inval_buf[CACHELINE_ROCE_VOFFSET_TO_IP]))) = rdma_ctx->ip_val;
             // Invalidation context
             data_required = ((rdma_ctx->ret & CACHELINE_INVALIDATION_DATA_REQ) > 0) ? 1 : 0;
             inval_mod = rdma_ctx->ret & CACHELINE_ROCE_RKEY_INVALIDATION_MASK; // if 0, then not invalidation
@@ -2904,62 +3235,140 @@ static __always_inline int check_inval_req_list_and_try(int from_inv, struct cnt
             self_request = (rdma_ctx->qp_val & CACHELINE_ROCE_QP_INV_REQUESTER) ? 1 : 0;
             dir_size = (unsigned int)((rdma_ctx->ret & CACHELINE_ROCE_RKEY_SIZE_MASK) >> CACHELINE_ROCE_RKEY_SIZE_SHIFT);
             pr_cache("[cRDMA] Inval (State: %u, Sharer: 0x%04x, Size: %u, ReqId: %d, Type: %c, IamReq: %d, QP: %u) for PID: %u, VA: 0x%llx, IP:0x%x\n",
-                    (unsigned int)rdma_ctx->state, (unsigned int)rdma_ctx->sharer, dir_size, get_id_from_requester(rdma_ctx->requester),
-                    shared_inval ? 'S' : 'M', self_request, inv_ctx->original_qp, rdma_ctx->pid, rdma_ctx->vaddr, rdma_ctx->ip_val);
-            
-            queue_length = atomic_read(&cnthread_inv_req_counter);
-            PROFILE_START(CN_latency_10us);
-            PROFILE_START(CN_latency_50us);
-            PROFILE_START(CN_latency_100us);
-            PROFILE_START(CN_latency_250us);
-            PROFILE_START(CN_latency_500us);
-            PROFILE_START(CN_latency_1000us);
-            debug_jiff = sched_clock();
+                     (unsigned int)rdma_ctx->state, (unsigned int)rdma_ctx->sharer, dir_size, get_id_from_requester(rdma_ctx->requester),
+                     shared_inval ? 'S' : 'M', self_request, inv_ctx->original_qp, rdma_ctx->pid, rdma_ctx->vaddr, rdma_ctx->ip_val);
+
+            queue_length = is_async ? atomic_read(&cnthread_async_req_counter) : atomic_read(&cnthread_inv_req_counter);
+            // PROFILE_START(CN_latency_10us);
+            // PROFILE_START(CN_latency_50us);
+            // PROFILE_START(CN_latency_100us);
+            // PROFILE_START(CN_latency_250us);
+            // PROFILE_START(CN_latency_500us);
+            // PROFILE_START(CN_latency_1000us);
+            // debug_jiff = sched_clock();
             barrier();
-            cnthread_find_and_evict(rdma_ctx->pid, rdma_ctx->vaddr, size_index_to_size(dir_size), TRY_INVALIDATION,
-                                    data_required, !shared_inval, inv_ctx->inval_buf, inv_ctx, from_inv == PROFILE_CNTHREAD_INV_ACK_SERV_FROM_PRMPT);
-            barrier();
-            debug_jiff = (unsigned long)(sched_clock() - debug_jiff) / 1000;
-            if (debug_jiff <= 10)
-                PROFILE_LEAVE(CN_latency_10us);
-            else if (debug_jiff <= 50)
-                PROFILE_LEAVE(CN_latency_50us);
-            else if (debug_jiff <= 100)
-                PROFILE_LEAVE(CN_latency_100us);
-            else if (debug_jiff <= 250)
-                PROFILE_LEAVE(CN_latency_250us);
-            else if (debug_jiff <= 500)
-                PROFILE_LEAVE(CN_latency_500us);
+            if (is_async == 0)
+            {
+                inv_ret = cnthread_find_and_evict(rdma_ctx->pid, rdma_ctx->vaddr, size_index_to_size(dir_size), TRY_INVALIDATION,
+                                        data_required, !shared_inval, inv_ctx->inval_buf, inv_ctx, from_inv == PROFILE_CNTHREAD_INV_ACK_SERV_FROM_PRMPT);
+                barrier();
+                if (inv_ret == CNTHREAD_SYNC_PART_FAILED)
+                {
+                    BUG();  // must not failed for invalidation
+                }
+                else if ((inv_ret != CNTHREAD_SYNC_PART_FAILED) && (inv_ret != CNTHREAD_NO_ASYNC_NEEDED))
+                {
+                    ret = CNTHREAD_RET_NEXT_TASK;
+                }
+                else // for CNTHREAD_NO_ASYNC_NEEDED
+                {
+                    // kfree(inv_ctx);
+                    ret = CNTHREAD_RET_RELEASE;
+                }    
+            }
             else
-                PROFILE_LEAVE(CN_latency_1000us);
-            kfree(inv_ctx);
+            {
+                inv_ret = cnthread_find_and_evict_remaining(rdma_ctx->pid, rdma_ctx->vaddr, size_index_to_size(dir_size), TRY_INVALIDATION,
+                                                data_required, !shared_inval, inv_ctx->inval_buf, inv_ctx, from_inv == PROFILE_CNTHREAD_INV_ACK_SERV_FROM_PRMPT);
+                barrier();
+                // kfree(inv_ctx);
+                ret = CNTHREAD_RET_RELEASE;
+            }
+
+            // debug_jiff = (unsigned long)(sched_clock() - debug_jiff) / 1000;
+            // if (debug_jiff <= 10)
+            //     PROFILE_LEAVE(CN_latency_10us);
+            // else if (debug_jiff <= 50)
+            //     PROFILE_LEAVE(CN_latency_50us);
+            // else if (debug_jiff <= 100)
+            //     PROFILE_LEAVE(CN_latency_100us);
+            // else if (debug_jiff <= 250)
+            //     PROFILE_LEAVE(CN_latency_250us);
+            // else if (debug_jiff <= 500)
+            //     PROFILE_LEAVE(CN_latency_500us);
+            // else
+            //     PROFILE_LEAVE(CN_latency_1000us);
             if (from_inv == PROFILE_CNTHREAD_INV_ACK_SERV_FROM_EVICT)
                 PROFILE_LEAVE(CN_update_roce_inv_req_evt);
-            else if(from_inv == PROFILE_CNTHREAD_INV_ACK_SERV_FROM_INVAL)
+            else if (from_inv == PROFILE_CNTHREAD_INV_ACK_SERV_FROM_INVAL)
                 PROFILE_LEAVE(CN_update_roce_inv_req_inv);
-            else if(from_inv == PROFILE_CNTHREAD_INV_ACK_SERV_FROM_PRMPT)
+            else if (from_inv == PROFILE_CNTHREAD_INV_ACK_SERV_FROM_PRMPT)
                 PROFILE_LEAVE(CN_update_roce_inv_req_prmpt);
-            return 0;
-        }else{
+            return ret;
+        }
+        else
+        {
             // Put it back to the list
-            spin_lock(&cnthread_inval_req_list_lock);
-            list_add(&inv_ctx->node, cn_inval_req_list.prev->prev);
-            spin_unlock(&cnthread_inval_req_list_lock);
-            return 1;
+            if (is_async == 0)
+            {
+                ret = CNTHREAD_RET_RETRY;
+                // spin_lock(&cnthread_inval_req_list_lock);
+                // list_add(&inv_ctx->node, cn_inval_req_list.prev->prev);
+                // spin_unlock(&cnthread_inval_req_list_lock);
+            }
+            else
+            {
+                BUG();  // must not happen
+            }
+            return ret;
         }
     }
-    return -1;
+    return CNTHREAD_RET_ERROR;
+}
+
+static int cnthread_sync_invalidation(void *inv_argv);
+static int cnthread_async_invalidation(void *inv_argv);
+static void cnthread_clean_inv_arg(int main_ret, void *inv_argv);
+static int cnthread_sync_invalidation(void *inv_argv)
+{
+    int ret = check_inval_req_list_and_try(PROFILE_CNTHREAD_INV_ACK_SERV_FROM_INVAL,
+                                           &((struct cnthread_inv_argv *)inv_argv)->inv_ctx, NULL, 0);
+    if (ret == CNTHREAD_RET_NEXT_TASK)
+    {
+        // Update invalidation context when populating the async list.
+        // Note this that when the sync validation is successfull, then only we populate the async queue.
+        struct cnthread_task_desc *task_desc = kzalloc(sizeof(*task_desc), GFP_KERNEL);
+        task_desc->argv = inv_argv;
+        task_desc->init_ftn = NULL;
+        task_desc->main_ftn = cnthread_async_invalidation;
+        task_desc->clean_ftn = cnthread_clean_inv_arg;
+        ((struct cnthread_inv_argv *)inv_argv)->inv_ctx.last_update = sched_clock();
+        cnthread_enqueue_task(CNTHREAD_ASYNC_INV_PRIO, task_desc);
+    }
+
+    return ret;
+}
+
+
+static int cnthread_async_invalidation(void *inv_argv)
+{
+    return check_inval_req_list_and_try(PROFILE_CNTHREAD_INV_ACK_SERV_FROM_INVAL,
+                                        &((struct cnthread_inv_argv *)inv_argv)->inv_ctx, NULL, 1);
+}
+
+static void cnthread_clean_inv_arg(int main_ret, void *inv_argv)
+{
+    if (main_ret == CNTHREAD_RET_RELEASE)
+    {
+        if (inv_argv)
+        {
+            kfree(((struct cnthread_inv_argv *)inv_argv));
+        }
+    }
 }
 
 static __always_inline void serve_inval_rdma_req(unsigned char* rdma_buf)
 {
     PROFILE_POINT_TIME(CN_update_roce_inv_req)
-    struct cnthread_inv_msg_ctx *inv_ctx = kzalloc(sizeof(struct cnthread_inv_msg_ctx), GFP_KERNEL);
+    struct cnthread_task_desc *task_desc = kzalloc(sizeof(struct cnthread_task_desc), GFP_KERNEL);
+    struct cnthread_inv_argv *inv_argv = kzalloc(sizeof(struct cnthread_inv_argv), GFP_KERNEL);
+    struct cnthread_inv_msg_ctx *inv_ctx;
     struct cnthread_rdma_msg_ctx *rdma_ctx;
-    if (!inv_ctx)
+    if (!task_desc || !inv_argv)
         BUG();
 
-    rdma_ctx = &inv_ctx->rdma_ctx;
+    inv_ctx = &(inv_argv->inv_ctx);
+    rdma_ctx = &(inv_ctx->rdma_ctx);
     // Mark that we picked this message
     rdma_buf[0] = 0x0;
     inval_rdma_retrieve_base(rdma_ctx, rdma_buf);
@@ -2976,9 +3385,11 @@ static __always_inline void serve_inval_rdma_req(unsigned char* rdma_buf)
     inv_ctx->is_locked = 0;
     // inv_ctx->last_update = jiffies;      // for tracking invalidation requests
     inv_ctx->last_update = sched_clock();
-    spin_lock(&cnthread_inval_req_list_lock);
-    list_add(&inv_ctx->node, &cn_inval_req_list);
-    spin_unlock(&cnthread_inval_req_list_lock);
+    task_desc->argv = (void*)inv_argv;
+    task_desc->init_ftn = NULL;
+    task_desc->main_ftn = cnthread_sync_invalidation;
+    task_desc->clean_ftn = cnthread_clean_inv_arg;
+    cnthread_enqueue_task(CNTHREAD_SYNC_INV_PRIO, task_desc);
     PROFILE_LEAVE(CN_update_roce_inv_req);
 }
 
@@ -3054,23 +3465,85 @@ void try_invalidation_lookahead(int from_inv, int lookahead)
 }
 EXPORT_SYMBOL(try_invalidation_lookahead);
 
+static __always_inline int receive_next_request(int from_inv)
+{
+    int i = 0, locked_req = 0;
+    struct cnthread_task_desc *task_desc = NULL;
+    get_cpu();
+    for (i = 0; i < DISAGG_QP_NUM_INVAL_BUF; i++)
+        try_invalidation_lookahead(from_inv, SERVE_ACK_PER_INV);
+
+    //Check priority queue
+    for (i = 0; i < CNTHREAD_TASK_QUEUE_NUM; i++)
+    {
+        task_desc = dequeue_task(i);
+        if (task_desc)
+        {
+            int res = CNTHREAD_RET_ERROR;
+            // TODO: run fetched task
+            if (task_desc->init_ftn)
+            {
+                task_desc->init_ftn(task_desc->argv);
+            }
+
+            if (task_desc->main_ftn)
+            {
+                res = task_desc->main_ftn(task_desc->argv);
+            }
+
+            if (task_desc->clean_ftn)
+            {
+                task_desc->clean_ftn(res, task_desc->argv);
+            }
+
+            if (res == CNTHREAD_RET_RETRY)
+            {
+                cnthread_enqueue_task_retry(i, task_desc);   // retry later
+                locked_req ++;
+                if (locked_req <= 1)
+                    i --;   // retry the current priority again
+                continue;
+            }else{
+                kfree(task_desc);   // we finish to use this task descriptor
+            }
+            put_cpu();
+            return 0;
+        }
+    }
+    // // Try invalidation
+    // if (check_inval_req_list_and_try(from_inv, NULL, 0) >= 0)    // If sucessfully served
+    // {
+    //     put_cpu();
+    //     return 0;
+    // }else{
+    //     // try to help async part
+    //     if (check_inval_req_list_and_try(from_inv, NULL, 1) >= 0)
+    //     {
+    //         put_cpu();
+    //         return 0;
+    //     }
+    // }
+
+    // No invalidation, return with -1
+    put_cpu();
+    return -1;
+}
+
 // == EVICTION HANDLER ROUTINE == //
-int cnthread_handler(void *data)
+int cnthread_worker_handler(void *data)
 {
     struct cnthread_handler_data *h_data = (struct cnthread_handler_data *)data;
     int *after_init_stage = h_data->init_stage;
-    int i, loop_i = 0;
+    int loop_i = 0;
 
     allow_signal(SIGKILL | SIGSTOP);
-    atomic_set(&DEBUG_trigger_eviction, 0);
     // Wait until roce kernel module is initialized (and connected to the switch)
     while (!(*after_init_stage))
     {
         usleep_range(10, 10);
     }
-    cnthread_initial_kmap();
-    pin_current_thread(EVICT_HANDLER_CPU);
-    pr_info("CN_thread_handler has been started\n");
+    pin_current_thread(h_data->pin_core_id);
+    pr_info("CN_worker_thread [%d] has been started\n", h_data->worker_id);
 
     while (1)
     {
@@ -3085,29 +3558,14 @@ int cnthread_handler(void *data)
             goto release;
         }
 
-        // Try evition
-        if (cnthread_evict_one(_threshold, _high_threshold) < 0) // If low cache pressure
+        if (receive_next_request(PROFILE_CNTHREAD_INV_ACK_SERV_FROM_EVICT) < 0)
         {
-            // Help invalidation handler
-            for (i = 0; i < DISAGG_QP_NUM_INVAL_BUF; i++)
-                try_invalidation_lookahead(PROFILE_CNTHREAD_INV_ACK_SERV_FROM_EVICT, SERVE_ACK_PER_INV_FROM_EVICT);
-            // Invalidation part
-            if (check_inval_req_list_and_try(PROFILE_CNTHREAD_INV_ACK_SERV_FROM_EVICT, NULL) < 0)
+            if (unlikely(loop_i >= DISAGG_NET_CTRL_POLLING_SKIP_COUNTER))
             {
-                // Wait if no eviction / pressure
-                if (unlikely(loop_i >= DISAGG_NET_CTRL_POLLING_SKIP_COUNTER))
-                {
-                    loop_i = 0;
-                    usleep_range(10, 10);
-                }
-                loop_i++;
+                loop_i = 0;
+                usleep_range(10, 10);
             }
-        }
-
-        if (atomic_read(&DEBUG_trigger_eviction))   // If it was activated by test module
-        {
-            cnthread_find_and_evict(DEBUG_eviction_tgid, DEBUG_eviction_addr, PAGE_SIZE, 0, 0, 0, NULL, NULL, 0);
-            atomic_set(&DEBUG_trigger_eviction, 0);
+            loop_i++;
         }
     }
 
@@ -3117,47 +3575,13 @@ release: // Please release memory here
         kfree(data);
         data = NULL; // meaningless
     }
-
-    // We are shutting down the system...
-    // TODO: we also need to unmap DMA address for dummy_page_buf and dummy_inv_page_buf
-    for (i = 0; i < 3 * DISAGG_NUM_CPU_CORE_IN_COMPUTING_BLADE; i++)
-    {
-        if (dummy_page_buf[i])
-        {
-            kfree(dummy_page_buf[i]);
-            dummy_page_buf[i] = NULL;
-        }
-    }
-    if (dummy_inv_page_buf)
-    {
-        kfree(dummy_inv_page_buf);
-        dummy_inv_page_buf = NULL;
-    }
     return 0;
 }
 
 // == INVALIDATION HANDLER ROUTINE == //
-static unsigned long inval_timer_start = 0;
-static __always_inline int receive_next_request(void)
-{
-    int i = 0;
-    get_cpu();
-    for (i = 0; i < DISAGG_QP_NUM_INVAL_BUF; i++)
-        try_invalidation_lookahead(PROFILE_CNTHREAD_INV_ACK_SERV_FROM_INVAL, SERVE_ACK_PER_INV);
-
-    // Try invalidation
-    if (check_inval_req_list_and_try(PROFILE_CNTHREAD_INV_ACK_SERV_FROM_INVAL, NULL) >= 0)    // If sucessfully served
-    {
-        put_cpu();
-        return 0;
-    }
-    // No invalidation, return with -1
-    put_cpu();
-    return -1;
-}
-
 // Main body of the invalidation handler
-int cache_ack_handler(void *data)
+static unsigned long inval_timer_start = 0;
+int cnthread_main_handler(void *data)
 {
     struct cnthread_handler_data *h_data = (struct cnthread_handler_data *)data;
     int *after_init_stage = h_data->init_stage;
@@ -3165,14 +3589,16 @@ int cache_ack_handler(void *data)
     unsigned long inval_timer_end;
 
     allow_signal(SIGKILL | SIGSTOP);
+    atomic_set(&DEBUG_trigger_eviction, 0);
+    cnthread_initial_task_queues();
 
     // Initialize socket
-    // - Wait until roce module is initialized (and connected to the switch)
     while (!recv_buf)
     {
         recv_buf = kmalloc(_recv_buf_size, GFP_KERNEL);
         msleep(1);
     }
+
     while (!ack_buf)
     {
         ack_buf = kmalloc(_recv_buf_size, GFP_KERNEL);
@@ -3181,13 +3607,16 @@ int cache_ack_handler(void *data)
     memset(ack_buf, 0, _recv_buf_size);
     pr_info("CN_ack_handler has been started\n");
 
+    // Wait until roce module is initialized (and connected to the switch)
     while (!(*after_init_stage))
     {
         usleep_range(10, 10);
     }
+    // Initialize cache pages (and corresponding DMA mappings)
+    cnthread_initial_kmap();
 
     if (!is_cache_ack_pinned)
-        pin_current_thread(INVAL_HANDLER_CPU);
+        pin_current_thread(h_data->pin_core_id);
     is_cache_ack_pinned = 1;
 
     udp_initialize(&recv_socket, DEFAULT_UDP_PORT);
@@ -3201,6 +3630,9 @@ int cache_ack_handler(void *data)
         pr_info("CN_thread_handler [inval buf[%d]: 0x%lx]\n",
                 i, (unsigned long)base_inval_buf[i]);
     }
+
+    // initialize kernel shared memory, as we initialized cache invaidation metadata
+    init_kernel_shared_mem();
 
     // Send initial test message
     inval_timer_start = jiffies;    // intial timer
@@ -3217,7 +3649,10 @@ int cache_ack_handler(void *data)
             goto release;
         }
 
-        if(receive_next_request())
+        // Try evition
+	    cnthread_evict_one(_threshold, _high_threshold);
+
+        if (receive_next_request(PROFILE_CNTHREAD_INV_ACK_SERV_FROM_INVAL) < 0)
         {
             if (unlikely(loop_i >= DISAGG_NET_CTRL_POLLING_SKIP_COUNTER))
             {
@@ -3226,6 +3661,12 @@ int cache_ack_handler(void *data)
             }
             loop_i++;
         }
+
+        // if (atomic_read(&DEBUG_trigger_eviction))   // If it was activated by test module
+        // {
+        //     cnthread_find_and_evict(DEBUG_eviction_tgid, DEBUG_eviction_addr, PAGE_SIZE, 0, 0, 0, NULL, NULL, 0);
+        //     atomic_set(&DEBUG_trigger_eviction, 0);
+        // }
 
         inval_timer_end = jiffies;
         if (unlikely((inval_timer_end > inval_timer_start) 
@@ -3240,15 +3681,39 @@ int cache_ack_handler(void *data)
 
 release: // Please release memory here
     // We are shutting down the system...
+    if (data)
+    {
+        kfree(data);
+        data = NULL; // meaningless
+    }
+
+    // TODO: we also need to unmap DMA address for dummy_page_buf and dummy_inv_page_buf
+    for (i = 0; i < 3 * DISAGG_NUM_CPU_CORE_IN_COMPUTING_BLADE; i++)
+    {
+        if (dummy_page_buf[i])
+        {
+            kfree(dummy_page_buf[i]);
+            dummy_page_buf[i] = NULL;
+        }
+    }
+
+    if (dummy_inv_page_buf)
+    {
+        kfree(dummy_inv_page_buf);
+        dummy_inv_page_buf = NULL;
+    }
+
     if (recv_buf)
     {
         kfree(recv_buf);
         recv_buf = NULL;
     }
+
     if (ack_buf)
     {
         kfree(ack_buf);
         ack_buf = NULL;
     }
+
     return 0;
 }

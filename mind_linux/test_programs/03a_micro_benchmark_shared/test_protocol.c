@@ -21,7 +21,7 @@ static pthread_barrier_t s_barrier, e_barrier, rs_barrier;
 // Read/write ratio (0, 25%, 50%, 75%, 100%)
 
 #define SLEEP_THRES_NANOS 10
-#define DATASET_SIZE (1000 * 1000LU)    // 4 KB * 1 million
+#define DATASET_SIZE (5 * 1000 * 1000LU)    // 4 KB * 1 million * 5 for small sized
 #define MAX_THREAD_NUM 32            // 4 for LegoOS, but we can do it up to 16
 #define PAGE_SIZE 4096LU
 #define LOCALITY 1  // all to one page
@@ -408,7 +408,7 @@ int main(int argc, char **argv) {
 
   unsigned long total_share_size = num_shared_pages * PAGE_SIZE; // FIXME maybe adjust this memory
 
-  unsigned long thread_local_size = local_num_pages * PAGE_SIZE;
+  unsigned long thread_local_size = local_num_pages * PAGE_SIZE / local_thread_num;
 
 
 // Allocate test memory mappings

@@ -11,7 +11,9 @@
  * management can be a bitch. See 'mm/memory.c': 'copy_page_range()'
  */
 #include <linux/fork.h>
-
+#ifdef CONFIG_COMPUTE_NODE
+#include <disagg/fork_disagg.h>
+#endif
 #include <trace/events/sched.h>
 
 #define CREATE_TRACE_POINTS
@@ -25,6 +27,7 @@ static int disagg_fork(unsigned long clone_flags, struct task_struct *tsk)
 #else
 #include <disagg/cnthread_disagg.h>
 #endif /* CONFIG_COMPUTE_NODE */
+#include <disagg/print_disagg.h>
 
 /*
  * Minimum number of threads to boot the kernel
@@ -869,14 +872,16 @@ EXPORT_SYMBOL_GPL(__mmdrop);
 
 static inline void __mmput(struct mm_struct *mm)
 {
-	VM_BUG_ON(atomic_read(&mm->mm_users));
-
 #ifdef CONFIG_COMPUTE_NODE
 	if (current->is_remote)
 	{
-		cnthread_flush_all_request(current->tgid);
+		// cnthread_flush_all_request(current->tgid);
+		pr_syscall("Try to remove cacheline in mmput\n");
+		cnthread_delete_all_request(current->tgid);
+		pr_syscall("After mmput\n");
 	}
 #endif
+	VM_BUG_ON(atomic_read(&mm->mm_users));
 
 	uprobe_clear_state(mm);
 	exit_aio(mm);
@@ -902,6 +907,7 @@ void mmput(struct mm_struct *mm)
 {
 	might_sleep();
 
+	print_remote_syscall_only("number of users: %d\n", atomic_read(&mm->mm_users));
 	if (atomic_dec_and_test(&mm->mm_users))
 		__mmput(mm);
 }
@@ -1089,44 +1095,52 @@ static int wait_for_vfork_done(struct task_struct *child,
  */
 void mm_release(struct task_struct *tsk, struct mm_struct *mm)
 {
+	print_remote_syscall_only("Before exit_robust_list");
 	/* Get rid of any futexes when releasing the mm */
 #ifdef CONFIG_FUTEX
 	if (unlikely(tsk->robust_list)) {
 		exit_robust_list(tsk);
 		tsk->robust_list = NULL;
 	}
+	print_remote_syscall_only("Before compat_exit_robust_list");
 #ifdef CONFIG_COMPAT
 	if (unlikely(tsk->compat_robust_list)) {
 		compat_exit_robust_list(tsk);
 		tsk->compat_robust_list = NULL;
 	}
 #endif
+	print_remote_syscall_only("Before exit_pi_state_list");
 	if (unlikely(!list_empty(&tsk->pi_state_list)))
 		exit_pi_state_list(tsk);
 #endif
 
 	uprobe_free_utask(tsk);
+	print_remote_syscall_only("After uprobe_free_utask");
 
 	/* Get rid of any cached register state */
 	deactivate_mm(tsk, mm);
+	print_remote_syscall_only("After deactivate_mm");
 
 	/*
 	 * Signal userspace if we're not exiting with a core dump
 	 * because we want to leave the value intact for debugging
 	 * purposes.
 	 */
-	if (tsk->clear_child_tid) {
-		if (!(tsk->signal->flags & SIGNAL_GROUP_COREDUMP) &&
-		    atomic_read(&mm->mm_users) > 1) {
-			/*
-			 * We don't check the error code - if userspace has
-			 * not set up a proper pointer then tough luck.
-			 */
-			put_user(0, tsk->clear_child_tid);
-			sys_futex(tsk->clear_child_tid, FUTEX_WAKE,
-					1, NULL, NULL, 0);
+	if (!tsk->is_remote)	// if it is remote, we already did this
+	{
+		if (tsk->clear_child_tid) {
+			if (!(tsk->signal->flags & SIGNAL_GROUP_COREDUMP) &&
+				atomic_read(&mm->mm_users) > 1) {
+				/*
+				* We don't check the error code - if userspace has
+				* not set up a proper pointer then tough luck.
+				*/
+				put_user(0, tsk->clear_child_tid);
+				sys_futex(tsk->clear_child_tid, FUTEX_WAKE,
+						1, NULL, NULL, 0);
+			}
+			tsk->clear_child_tid = NULL;
 		}
-		tsk->clear_child_tid = NULL;
 	}
 
 	/*
@@ -1135,6 +1149,7 @@ void mm_release(struct task_struct *tsk, struct mm_struct *mm)
 	 */
 	if (tsk->vfork_done)
 		complete_vfork_done(tsk);
+	print_remote_syscall_only("After complete_vfork_done");
 }
 
 /*
@@ -1484,7 +1499,40 @@ static inline void rcu_copy_process(struct task_struct *p)
 	p->rcu_tasks_idle_cpu = -1;
 #endif /* #ifdef CONFIG_TASKS_RCU */
 }
+#ifdef CONFIG_COMPUTE_NODE
+loff_t get_file_mappings_and_alloc_fork_msg(struct fork_msg_struct **fork_msg,
+        struct task_struct *p) {
+      size_t num_file_mappings = count_read_only_file_mappings(p);
 
+      //allocate fork_msg and fill the fields about file mappings
+      size_t tot_size = sizeof(struct fork_msg_struct) +
+          sizeof(struct file_mapping_info) * (num_file_mappings - 1);
+      *fork_msg = kmalloc(tot_size, GFP_KERNEL);
+      if (!*fork_msg) {
+          pr_err("can not allocate fork_msg\n");
+          return -ENOMEM;
+      }
+      (*fork_msg)->num_file_mappings = num_file_mappings;
+      //print it
+      pr_info("%s has %lu read-only file mappings\n", current->comm, num_file_mappings);
+
+      //fill fork_msg
+      return fill_fork_msg_mappings(*fork_msg, p);
+  }
+
+    void dummy_debug_multithread(struct task_struct *p) {
+        struct fork_msg_struct *payload = NULL;
+        static bool start_print_fork_msg = 0;
+        if (strcmp(current->comm, "a.out") == 0) {
+            start_print_fork_msg = 1;
+        }
+        if (start_print_fork_msg) {
+            get_file_mappings_and_alloc_fork_msg(&payload, p);
+            fill_fork_msg_hwcontext(payload, p);
+            //add_one_fork_req(payload, 1);
+        }
+    }
+#endif
 /*
  * This creates a new process as a copy of the old one,
  * but does not actually start it yet.
@@ -1596,6 +1644,7 @@ static __latent_entropy struct task_struct *copy_process(
 		p->is_remote = is_remote_task(p->cred->uid.val);
 		p->is_test = 0;
 	}
+    p->run_on_other_node = 0;
 
 	/*
 	 * If multiple threads are within copy_process(), then this check
@@ -1799,6 +1848,10 @@ static __latent_entropy struct task_struct *copy_process(
 	INIT_LIST_HEAD(&p->thread_group);
 	p->task_works = NULL;
 
+	// printk(KERN_DEFAULT "Copy_mm: %s (uid:%d, pid: %d) -> (pid:%d)\n", 
+	// 		current->comm, (int)current->cred->uid.val, (int)current->pid,
+	// 		(int)p->pid);
+
 	cgroup_threadgroup_change_begin(current);
 	/*
 	 * Ensure that the cgroup subsystem policies allow the new process to be
@@ -1907,6 +1960,11 @@ static __latent_entropy struct task_struct *copy_process(
 	uprobe_copy_process(p, clone_flags);
 
 #ifdef CONFIG_COMPUTE_NODE
+    //a dummy test for get_file_mappings_and_alloc_fork_msg****************************
+    //TODO remote me
+    //dummy_debug_multithread(p);
+    //*********************************************************************************
+    
 	// We should do this after we get new pid
 	/* notify fork to remote memory */
 	if (p->is_remote){
@@ -2054,9 +2112,24 @@ long _do_fork(unsigned long clone_flags,
 			init_completion(&vfork);
 			get_task_struct(p);
 		}
-
+#ifdef CONFIG_COMPUTE_NODE
+        if (!p->run_on_other_node) {
+			//pr_info("parent[%s] tgid[%d] child[%s] tgid[%d] run on local node\n",
+			//	current->comm, current->pid, p->comm, p->pid);
+			if (current->is_remote)
+				p->is_remote = 1;
+			// if (current->is_example)
+			// 	p->is_example = 1;
+		    wake_up_new_task(p);
+			
+		} else {
+			// this is a bug, should be '='.
+			// However its' been working, so don't touch it for now
+            p->state = TASK_STOPPED;
+		}
+#else
 		wake_up_new_task(p);
-
+#endif
 		/* forking complete and child started to run, tell ptracer */
 		if (unlikely(trace))
 			ptrace_event_pid(trace, pid);

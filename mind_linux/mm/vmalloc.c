@@ -1199,6 +1199,22 @@ void *vm_map_ram(struct page **pages, unsigned int count, int node, pgprot_t pro
 }
 EXPORT_SYMBOL(vm_map_ram);
 
+void *vm_map_va_only(unsigned long start, unsigned long end, unsigned long size)
+{
+	unsigned long addr;
+	void *mem;
+	struct vmap_area *va;
+	va = alloc_vmap_area(size, PAGE_SIZE,
+						 start, end, NUMA_NO_NODE, GFP_KERNEL);
+	if (IS_ERR(va))
+		return NULL;
+
+	addr = va->va_start;
+	mem = (void *)addr;
+	return mem;
+}
+EXPORT_SYMBOL(vm_map_va_only);
+
 static struct vm_struct *vmlist __initdata;
 /**
  * vm_area_add_early - add vmap area early during boot

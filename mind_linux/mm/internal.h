@@ -547,7 +547,7 @@ unsigned long do_disagg_mmap(struct task_struct *tsk,
 unsigned long do_disagg_mmap_owner(struct task_struct *tsk,
             unsigned long addr, unsigned long len, unsigned long prot,
 			unsigned long flags, vm_flags_t vm_flags, unsigned long pgoff,
-			struct file *file, int *ownership);
+			struct file *file, int *ownership, int writable_file_map);
 
 unsigned long disagg_brk(struct task_struct *tsk, unsigned long brk);
 

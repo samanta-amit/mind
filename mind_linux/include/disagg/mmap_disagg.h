@@ -10,8 +10,9 @@
 #define VM_CACHE_OWNER 0x04000000
 
 struct mmap_msg_struct {
-	u32	pid;
-	u32	tgid;
+	u16	pid;
+	u16	tgid;
+	u32 need_cache_entry;
 	unsigned long addr;
     unsigned long len;
     unsigned long prot;

@@ -1,0 +1,7 @@
+#!/bin/bash
+sudo mst start
+echo 16 | sudo tee /sys/class/infiniband/mlx5_1/device/mlx5_num_vfs
+ifconfig -a | grep enp175s
+#
+echo 4 | sudo tee /sys/class/infiniband/mlx5_0/device/mlx5_num_vfs
+ifconfig -a | grep enp59s

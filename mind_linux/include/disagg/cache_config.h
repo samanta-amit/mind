@@ -13,7 +13,7 @@ enum{
 #define REGION_SIZE_BASE 12  // for 4KB
 #define DYN_MIN_DIR_SIZE 4096
 
-#define MIND_USE_TSO
+// #define MIND_USE_TSO
 
 #define SERVE_ACK_PER_INV 16
 #define SERVE_ACK_PER_INV_FROM_EVICT 16

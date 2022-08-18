@@ -49,4 +49,4 @@ obj-$(CONFIG_PAGE_TABLE_ISOLATION)		+= pti.o
 obj-$(CONFIG_AMD_MEM_ENCRYPT)	+= mem_encrypt.o
 obj-$(CONFIG_AMD_MEM_ENCRYPT)	+= mem_encrypt_boot.o
 
-obj-$(CONFIG_COMPUTE_NODE)	+= fault_disagg.o
+obj-$(CONFIG_COMPUTE_NODE)	+= fault_disagg.o prefetch_disagg.o

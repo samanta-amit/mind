@@ -20,9 +20,13 @@ static int send_exit_mm(struct task_struct *tsk, unsigned long clone_flags)
 
     payload.pid = tsk->pid;
 	payload.tgid = tsk->tgid;
+    payload.flag = clone_flags;
 
     ret = send_msg_to_memory(DISSAGG_EXIT, &payload, sizeof(payload), 
                              reply, sizeof(*reply));
+
+    // ret = send_msg_to_memory_rdma(DISSAGG_EXIT, &payload, sizeof(payload), 
+    //                         reply, sizeof(*reply));
 	printk(KERN_DEFAULT "EXIT - Data from CTRL [%d]: ret: %d [0x%llx]\n",
 		ret, reply->ret, *(long long unsigned*)(reply));
 
@@ -47,12 +51,25 @@ int disagg_exit(struct task_struct *tsk)
 {
     int err;
     int cnt = atomic_dec_return(get_test_program_thread_cnt());
+    unsigned long exit_flag = EXIT_FIRST_TRY;
 
-    if (tsk->is_test)
+    if (tsk->is_remote)
         pr_syscall("EXIT: cnt[%d]\n", cnt);
-    if (tsk->is_test && cnt >= 1)
+
+    if (tsk->is_remote)
     {
-        err = 0;
+        if (cnt > 0)
+            err = 0;
+        else {
+retry_send_exit:
+            err = send_exit_mm(tsk, exit_flag);
+            if (err == -ERR_DISAGG_REMOTE_WAIT_EXIT) {
+                pr_info("remote tgroup wait exit\n");
+                ssleep(MIND_EXIT_RETRY_IN_SEC);
+                exit_flag = EXIT_RETRY;
+                goto retry_send_exit;
+            }
+        }
     }else{
         err  = send_exit_mm(tsk, 0);
     }
@@ -64,6 +81,9 @@ int disagg_exit(struct task_struct *tsk)
 		err = 0;
 	}
 
+    //TODO clear req buf if cnt == 0?
+    // clear cache
+    // disagg_clear_req_buffer(tsk);
     return err;
 }
 

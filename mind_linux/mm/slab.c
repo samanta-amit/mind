@@ -118,6 +118,7 @@
 #include	<linux/prefetch.h>
 #include	<linux/sched/task_stack.h>
 
+#include        <kernel/cnthread_kern_disagg.c>
 #include	<net/sock.h>
 
 #include	<asm/cacheflush.h>
@@ -1234,10 +1235,14 @@ static void __init set_up_node(struct kmem_cache *cachep, int index)
 void __init kmem_cache_init(void)
 {
 	int i;
+	unsigned long alloc_addr_new = 0;
 
 	BUILD_BUG_ON(sizeof(((struct page *)NULL)->lru) <
 					sizeof(struct rcu_head));
 	kmem_cache = &kmem_cache_boot;
+	printk(KERN_INFO "Message:\n");
+	alloc_addr_new = send_kshmem_alloc(test_size);
+	printk("test: alloc_addr_new: %lu \n", (unsigned long)alloc_addr_new);
 
 	if (!IS_ENABLED(CONFIG_NUMA) || num_possible_nodes() == 1)
 		use_alien_caches = 0;

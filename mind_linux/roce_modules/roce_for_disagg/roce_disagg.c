@@ -183,6 +183,7 @@ int send_rdma_meta(unsigned int lid, unsigned int psn, unsigned int *qpn, char *
     memcpy(payload.gid, gid, gid_size);
     payload.addr = 0;
     payload.size = 0;
+    payload.kshmem_va_start = kshmem_get_start_va();
 
     pr_info("Gid size: %d\n", gid_size);
     for (i = 0; i < gid_size; i++)

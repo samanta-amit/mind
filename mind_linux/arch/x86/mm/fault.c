@@ -30,6 +30,8 @@
 
 #include "mm_internal.h"
 
+extern void print_page_checksum(char *data_ptr, unsigned long addr);
+
 /*
  * Returns 0 if mmiotrace is disabled, or if the fault is not
  * handled by mmiotrace:
@@ -1279,6 +1281,10 @@ __do_page_fault(struct pt_regs *regs, unsigned long error_code,
 	 * (error_code & 4) == 0, and that the fault was not a
 	 * protection error (error_code & 9) == 0.
 	 */
+#ifdef CONFIG_COMPUTE_NODE
+	// Skip tests for kernel shared memory
+	if (!is_kshmem_address(address)) {
+#endif
 	if (unlikely(fault_in_kernel_space(address))) {
 		if (!(error_code & (X86_PF_RSVD | X86_PF_USER | X86_PF_PROT))) {
 			if (vmalloc_fault(address) >= 0)
@@ -1321,6 +1327,9 @@ __do_page_fault(struct pt_regs *regs, unsigned long error_code,
 		bad_area_nosemaphore(regs, error_code, address, NULL);
 		return;
 	}
+#ifdef CONFIG_COMPUTE_NODE
+	}
+#endif
 
 	/*
 	 * It's safe to allow irq's after cr2 has been saved and the
@@ -1349,7 +1358,7 @@ __do_page_fault(struct pt_regs *regs, unsigned long error_code,
 	 * Here, we may try to forward page fault to memory node
 	 */
 	#ifdef CONFIG_COMPUTE_NODE
-	if (tsk->is_remote){
+	if (tsk->is_remote || is_kshmem_address(address)){
 		do_disagg_page_fault(tsk, regs, error_code, address, flags);
 		return;
 	}
@@ -1392,13 +1401,6 @@ retry:
 	 * Try to get vma, filter out bad page fault
 	 */
 	vma = find_vma(mm, address);
-	// ONLY FOR DEBUGGING
-	// #ifdef CONFIG_COMPUTE_NODE
-	// if (tsk->is_test)
-	// {
-	// 	print_pgfault_error(tsk, error_code, address, vma);
-	// }
-	// #endif
 	if (unlikely(!vma)) {
 		goto bad_area;
 	}

@@ -62,6 +62,8 @@ struct fault_data_struct {
 } __packed;
 
 #ifndef BF_CONTORLLER
+void do_disagg_page_fault_prefetch(struct task_struct *tsk, unsigned long address);
+
 // pte_t *find_pte(unsigned long address);
 pte_t *find_pte_target(struct mm_struct *mm, unsigned long address);
 pte_t *find_pte_target_lock(struct mm_struct *mm, unsigned long address, spinlock_t **ptl_ptr);
