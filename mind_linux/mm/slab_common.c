@@ -190,7 +190,7 @@ static void free_memcg_params(struct rcu_head *rcu)
 	kvfree(old);
 }
 
-static int update_memcg_params(struct kmem_cache *s, int new_array_size)
+static increate_simplefs_cachet update_memcg_params(struct kmem_cache *s, int new_array_size)
 {
 	struct memcg_cache_array *old, *new;
 
@@ -916,6 +916,9 @@ struct kmem_cache *__init create_kmalloc_cache(const char *name, size_t size,
 struct kmem_cache *kmalloc_caches[KMALLOC_SHIFT_HIGH + 1];
 EXPORT_SYMBOL(kmalloc_caches);
 
+struct kmem_cache *kmalloc_simplefs_caches[KMALLOC_SHIFT_HIGH + 1];
+EXPORT_SYMBOL(kmalloc_simplefs_caches);
+
 #ifdef CONFIG_ZONE_DMA
 struct kmem_cache *kmalloc_dma_caches[KMALLOC_SHIFT_HIGH + 1];
 EXPORT_SYMBOL(kmalloc_dma_caches);
@@ -983,6 +986,10 @@ struct kmem_cache *kmalloc_slab(size_t size, gfp_t flags)
 #ifdef CONFIG_ZONE_DMA
 	if (unlikely((flags & GFP_DMA)))
 		return kmalloc_dma_caches[index];
+
+#ifdef CONFIG_ZONE_SHARED
+	if (unlikely((flags & GFP_SHARED)))
+		return kmalloc_simplefs_caches[index];
 
 #endif
 	return kmalloc_caches[index];
