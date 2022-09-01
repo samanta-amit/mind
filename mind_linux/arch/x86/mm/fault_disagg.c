@@ -19,6 +19,8 @@
 #include <linux/mmu_notifier.h>	/* ptep_clear_flush_notify ... */
 #include <linux/random.h>
 
+#include <linux/smp.h>
+
 #include <asm/cpufeature.h>		/* boot_cpu_has, ...		*/
 #include <asm/traps.h>			/* dotraplinkage, ...		*/
 #include <asm/pgalloc.h>		/* pgd_*(), ...			*/
@@ -38,6 +40,7 @@
 #include <disagg/fault_disagg.h>
 #include <disagg/exec_disagg.h>
 #include <disagg/cnthread_disagg.h>
+#include <disagg/kshmem_disagg.h>
 #include <disagg/print_disagg.h>
 #include <disagg/profile_points_disagg.h>
 
@@ -62,6 +65,8 @@ no_context(struct pt_regs *regs, unsigned long error_code,
 extern noinline void    // was static
 mm_fault_error(struct pt_regs *regs, unsigned long error_code,
 	       unsigned long address, u32 *pkey, unsigned int fault);
+
+extern void DEBUG_print_vma(struct mm_struct *mm);
 
 DEFINE_PROFILE_POINT(FH_fault_handler)
 DEFINE_PROFILE_POINT(FH_fault_handler_tot)
@@ -106,14 +111,20 @@ __always_inline static int send_pfault_to_mn(
 	u32 tot_size = sizeof(struct fault_reply_struct);
 	PROFILE_START_EVAL(FH_fetch_remote_tot);
 
-	payload.tgid = tsk->tgid;
+	payload.tgid = is_kshmem_address(address) ? DISAGG_KERN_TGID : tsk->tgid;
 	payload.address = address;
 	payload.error_code = error_code;
 	payload.flags = reset_req;
 
-	// Check the size of the received data: it should have at least default struct size
+	// PROFILE_START(FH_fetch_remote_data);
+	// check the size of the received data: it should have at least default struct size
 	res = send_msg_to_memory_rdma(DISSAGG_PFAULT, &payload, sizeof(payload),
 								  reply, tot_size);
+	// PROFILE_LEAVE(FH_fetch_remote_data);
+	pr_pgfault("\tsend tgid[%d] addr[%lx] errcode[%lx] flags[%x]; recv ret[%d]",
+			   is_kshmem_address(address) ? DISAGG_KERN_TGID : tsk->tgid,
+			   address, error_code, reset_req, (reply)->ret);
+
 	if(likely(res >= 0))
 	{
 		res = (reply)->ret;
@@ -132,10 +143,26 @@ static pte_t *find_pte_from_reg(unsigned long address)
 	return lookup_address_in_pgd(pgd, address, &level);
 }
 
-void print_pgfault_error(struct task_struct *tsk, unsigned long error_code, 
-	unsigned long address, struct vm_area_struct *vma)
+static pte_t *find_pte_from_mm(struct mm_struct *mm, unsigned long address)
 {
-	pte_t *pte = find_pte_from_reg(address);
+	pgd_t *pgd;
+	unsigned int level;
+	if (mm)
+	{
+		pgd = pgd_offset(mm, address);
+		return lookup_address_in_pgd(pgd, address, &level);
+	}else{
+		return NULL;
+	}
+}
+
+void print_pgfault_error(struct task_struct *tsk, unsigned long error_code, 
+	unsigned long address, struct vm_area_struct *vma, int is_prefetch)
+{
+	// pte_t *pte = find_pte_from_reg(address);
+	pte_t *pte = NULL;
+	if (!is_prefetch)
+		find_pte_from_mm(is_kshmem_address(address) ? &init_mm : tsk->mm, address);
 
 	printk(KERN_DEFAULT "CN: fault handler - (tgid: %d, pid: %d, W: %d, pR/W: %d/%d, an: %d, pte_fl: 0x%03lx, pfn: 0x%06lx, err: 0x%02lx) - addr: 0x%lx, vma: 0x%lx - 0x%lx [0x%lx], st[0x%lx]\n",
 		(int)tsk->tgid, (int)tsk->pid,
@@ -149,7 +176,7 @@ void print_pgfault_error(struct task_struct *tsk, unsigned long error_code,
 		vma ? vma->vm_start : 0,
 		vma ? vma->vm_end : 0,
 		vma ? vma->vm_flags : 0,
-		tsk->mm->start_stack);
+		tsk->mm ? tsk->mm->start_stack : 0);
 }
 
 static pte_t *find_pte(unsigned long address)
@@ -276,7 +303,9 @@ __always_inline static pte_t *ensure_pte(struct mm_struct *mm, unsigned long add
 	}
 
 return_pte:
+	// PROFILE_LEAVE(FH_PTE_ALLOC_PTE);
 	pte = pte_offset_map(pmd, address);
+	// barrier();
 	*ptl_ptr = pte_lockptr(mm, pmd);
 	return pte;
 }
@@ -307,14 +336,17 @@ void *prepare_data_page(
 	vm_start = address;
 	vm_end = vm_start + PAGE_SIZE;
 	// TODO: eventually, we will not rely on VMA structure at all
-	if (!vma)
+	if (!vma && tgid != DISAGG_KERN_TGID)
 	{
 		struct vm_area_struct *prev;
 		struct rb_node **rb_link, *rb_parent;
 
 		if (unlikely(vm_start <= 0 || vm_end <= vm_start))
 		{
+			printk(KERN_ERR "VMA ERROR: 0x%lx - 0x%lx\n", vm_start, vm_end);
+			//print_pgfault_error(current, error_code, address, vma);
 			BUG();
+			// return NULL;
 		}
 
 		// Adjust existing VMAs to be not overlapping
@@ -371,19 +403,19 @@ void *prepare_data_page(
 				if (unlikely(anon_vma_prepare(vma)))
 					BUG(); // TODO: unmap VMA and return
 
-				printk(KERN_DEFAULT "0) VMA is created [0x%lx]: 0x%lx - 0x%lx [0x%lx - 0x%lx, 0x%lx]\n",
-					   address, vm_start, vm_end, vma->vm_start, vma->vm_end, vma->vm_flags);
+				pr_pgfault(KERN_DEFAULT "0) VMA is created [0x%lx]: 0x%lx - 0x%lx [0x%lx - 0x%lx, 0x%lx]\n",
+						   address, vm_start, vm_end, vma->vm_start, vma->vm_end, vma->vm_flags);
 			}
 		}
 		downgrade_write(&mm->mmap_sem);
 	}
-
 	/*
 	 *	Here we prepare page only for unpresented pte
 	 */
 	if (!pte_present(*entry))
 	{
-		cnreq = cnthread_get_new_page(tgid, address, mm, existing_page);
+		pr_pgfault("\tpage[%lx] not present\n", address);
+		cnreq = cnthread_get_new_page(tgid, address, mm, existing_page); //&is_modified_cache);
 		if (!cnreq)
 			goto under_eviction;
 
@@ -402,7 +434,8 @@ void *prepare_data_page(
 	}
 	else if (pte_present(*entry) && !pte_write(*entry))
 	{
-		cnreq = cnthread_get_page(tgid, address, mm, existing_page);
+pr_pgfault("\tpage[%lx] present & not writable\n", address);
+		cnreq = cnthread_get_page(tgid, address, mm, existing_page); // get existing or new
 		if (!cnreq)
 			goto under_eviction;
 
@@ -416,6 +449,7 @@ void *prepare_data_page(
 	return new_data;
 
 under_eviction:
+pr_pgfault("\tpage[%lx] under eviction or invalidation\n", address);
 	*new_cnreq_ptr = NULL;
 	return NULL;
 }
@@ -431,12 +465,12 @@ static __always_inline int wait_ack_from_ctrl(struct cache_waiting_node *node, s
 }
 
 static __always_inline pte_t *restore_data_page(
-	struct mm_struct *mm, pte_t *entry,
+	struct task_struct *cur_tsk, pte_t *entry,
 	unsigned long address, unsigned long error_code,
 	unsigned long vm_flags,
 	struct vm_area_struct **_vma, unsigned long data_dma_addr,
 	struct cnthread_req *cnreq,
-	int existing_page)
+	int existing_page, int is_prefetch)
 {
 	pte_t pte_val, prev_pte_val;
 	struct page *page = NULL, *old_page = NULL;
@@ -500,7 +534,7 @@ static __always_inline pte_t *restore_data_page(
 		{
 			printk(KERN_DEFAULT "Error - cnreq was not allocated (%d) with pte: 0x%lx\n",
 				   need_new_page, (unsigned long)entry->pte);
-			print_pgfault_error(current, error_code, address, vma);
+			print_pgfault_error(cur_tsk, error_code, address, vma, is_prefetch);
 			BUG();
 		}
 
@@ -509,14 +543,14 @@ static __always_inline pte_t *restore_data_page(
 		{
 			printk(KERN_DEFAULT "Error - page was not allocated (%d) with pte: 0x%lx\n",
 				   need_new_page, (unsigned long)entry->pte);
-			print_pgfault_error(current, error_code, address, vma);
+			print_pgfault_error(cur_tsk, error_code, address, vma, is_prefetch);
 			BUG();
 		}
 		need_new_page = 1;
 	}else{	// Case 3: errous case
 		printk(KERN_DEFAULT "Error on need_new_page (%d) with pte: 0x%lx\n",
 				need_new_page, (unsigned long)entry->pte);
-		print_pgfault_error(current, error_code, address, vma);
+		print_pgfault_error(cur_tsk, error_code, address, vma, is_prefetch);
 		BUG();
 	}
 	prev_pte_val = *entry;
@@ -529,16 +563,20 @@ static __always_inline pte_t *restore_data_page(
 	smp_wmb();
 	__set_bit(PG_uptodate, &page->flags);
 
-	// TRY to skip flush cache (we are just adding empty page...)
-	if(unlikely(check_stable_address_space(mm)))
+	// Update mm for user process
+	if (!is_kshmem_address(address))
 	{
-		printk(KERN_DEFAULT "CN: fault handler - not stable address space\n");
-		BUG();
-	}
-	// XXX: why accounted as MM_FILEPAGES not MM_ANONPAGES?
-	if (need_new_page)
-	{
-		inc_mm_counter(mm, MM_FILEPAGES);
+		// TRY to skip flush cache (we are just adding empty page...)
+		if(unlikely(check_stable_address_space(cur_tsk->mm)))
+		{
+			printk(KERN_DEFAULT "CN: fault handler - not stable address space\n");
+			BUG();
+		}
+		// XXX: why accounted as MM_FILEPAGES not MM_ANONPAGES?
+		if (need_new_page)
+		{
+			inc_mm_counter(cur_tsk->mm, MM_FILEPAGES);
+		}
 	}
 
 	PROFILE_START(FH_DATA_pte);
@@ -553,8 +591,9 @@ static __always_inline pte_t *restore_data_page(
 	pte_val = pte_mkyoung(pte_val);
 	// pte_val = pte_mkold(pte_val);	// clear accessed bit
 	smp_wmb();
-	set_pte_at_notify(mm, address, entry, pte_val);
-	mmu_notifier_invalidate_range_only_end(mm, address, address + PAGE_SIZE);
+	set_pte_at_notify(is_kshmem_address(address) ? &init_mm : cur_tsk->mm, address, entry, pte_val);
+	mmu_notifier_invalidate_range_only_end(is_kshmem_address(address) ? &init_mm : cur_tsk->mm,
+										   address, address + PAGE_SIZE);
 
 	if (old_page)
 	{
@@ -576,7 +615,7 @@ static void check_sync_rss_stat(struct task_struct *tsk)
 {
 	if (unlikely(tsk != current))
 		return;
-	if (unlikely(tsk->rss_stat.events++ > TASK_RSS_EVENTS_THRESH))
+	if (tsk->mm && unlikely(tsk->rss_stat.events++ > TASK_RSS_EVENTS_THRESH))
 		sync_mm_rss(tsk->mm);
 }
 
@@ -599,17 +638,16 @@ static void help_invalidation_and_sleep(int back_off_cnt)
 		udelay(DISAGG_NACK_RETRY_IN_USEC * back_off_cnt);
 }
 
-static enum {
+enum {
 	FH_ALREADY_EVICT = 1,
 	FH_NACK_NORMAL = 2,
 	FH_NACK_FROM_RESTORE = 3,
 	FH_ALREADY_EVICT_WAIT = 10,
 };
 
-// noinline 
 void
-do_disagg_page_fault(struct task_struct *tsk, struct pt_regs *regs, 
-    unsigned long error_code, unsigned long address, unsigned int flags)
+_do_disagg_page_fault(struct task_struct *tsk, struct pt_regs *regs,
+    unsigned long error_code, unsigned long address, unsigned int flags, int is_prefetch)
 {
     struct mm_struct *mm = tsk->mm;
     struct vm_area_struct *vma;
@@ -620,11 +658,15 @@ do_disagg_page_fault(struct task_struct *tsk, struct pt_regs *regs,
 	int existing_page = 0;
 	int try_inval_proc = 0;
 	volatile int return_code = 0;
+	static volatile unsigned long return_cnt = 0;	// only used for pagefault debugging msg
 	struct cache_waiting_node *wait_node = NULL;
 	unsigned int is_bad_area = 0;
 	volatile unsigned long start_jiff = 0, net_jiff = 0, wait_jiff = 0;
 	unsigned int back_off_cnt = 1;
 	int clear_responsibility = 0;
+	spinlock_t *ptl_ptr = NULL;
+	struct task_struct *cur_tsk = NULL;
+	int is_kern_shared_mem = 0;
 	PROFILE_POINT_TIME(FH_fault_handler)
 	PROFILE_POINT_TIME(FH_fault_handler_tot)
 	PROFILE_POINT_TIME(FH_pte_lock)
@@ -652,8 +694,22 @@ do_disagg_page_fault(struct task_struct *tsk, struct pt_regs *regs,
 	PROFILE_POINT_TIME(FH_succ_net_lat)
 	PROFILE_POINT_TIME(FH_shared_net_lat)
 	PROFILE_POINT_TIME(FH_modified_net_lat)
-	// Start total latency tracking
+	// start total latency tracking
 	PROFILE_START(FH_fault_handler_tot);
+
+	if (tsk->is_test)
+		pr_pgfault("begin pfault tgid[%d] pid[%d] ip[%lx] addr[%lx] errcode[%lx] CPU[%d]\n",
+				   tsk->tgid, tsk->pid, regs->ip, address, error_code, smp_processor_id());
+
+	// we need to use kernel's mm for kernel shared memory
+	if (is_kshmem_address(address))
+	{
+		is_kern_shared_mem = 1;
+		if (!mm)
+		{
+			mm = &init_mm;
+		}
+	}
 
 	/*
 	 * When running in the kernel we expect faults to occur only to
@@ -673,6 +729,9 @@ do_disagg_page_fault(struct task_struct *tsk, struct pt_regs *regs,
 	 */
 	if (unlikely(!down_read_trylock(&mm->mmap_sem)))
 	{
+		if (is_prefetch)
+			return; // just fail here
+
 		if (!(error_code & X86_PF_USER) &&
 		    !search_exception_tables(regs->ip)) {
 			bad_area_nosemaphore(regs, error_code, address, NULL);
@@ -680,7 +739,7 @@ do_disagg_page_fault(struct task_struct *tsk, struct pt_regs *regs,
 		}
 retry:
 		down_read(&mm->mmap_sem);
-	}
+}
 	else
 	{
 		/*
@@ -701,6 +760,7 @@ retry:
 	wait_node = NULL;
 	is_bad_area = 0;
 	start_jiff = sched_clock();
+	cur_tsk = is_prefetch ? tsk : current;
 
 	PROFILE_START(FH_fault_handler);
 	PROFILE_START(FH_nack_and_retry);
@@ -715,14 +775,19 @@ retry:
 	/*
 	 * Try to get vma, filter out bad page fault
 	 */
-	vma = find_vma(mm, address); // current or next vma
+
+	if (is_kern_shared_mem)
+	{
+		vma = NULL;
+	}else{
+		vma = find_vma(mm, address); // current or next vma
+	}
 	fault = 0;
 	if (!(error_code & X86_PF_INSTR))
 	{
-		if (current->is_test && vma && !TEST_is_test_vma(vma->vm_start, vma->vm_end))
-		{
-			goto normal_linux_routine;
-		}
+#ifdef PRINT_PAGE_FAULT
+		print_pgfault_error(cur_tsk, error_code, address, vma, is_prefetch);
+#endif
 		// VMA: the first vma of which the vm_end > address
 		if (!vma || (vma && (vma->vm_start > address)) // normal case (e.g., newly mapped mmaps)
 			|| (vma_is_anonymous(vma) && !(vma->vm_file) &&
@@ -732,15 +797,16 @@ retry:
 				 (!(error_code & X86_PF_WRITE) && !(vma->vm_flags & VM_READ))))
 		)
 		{
-			spinlock_t *ptl_ptr = NULL;
 			pte_t *entry, pte_value;
 			int wait_err = -1;
 			struct cnthread_req *new_cnreq = NULL;
+			ptl_ptr = NULL;
 			PROFILE_START(FH_find_pte);
 			entry = ensure_pte(mm, (address & PAGE_MASK), &ptl_ptr);
 			if (unlikely(!entry || !ptl_ptr))
 			{
 				printk(KERN_DEFAULT "CN: fault handler - cannot get pte\n");
+				up_read(&mm->mmap_sem);
 				BUG();
 			}
 			PROFILE_LEAVE(FH_find_pte);
@@ -754,26 +820,33 @@ retry:
 					   (unsigned long)entry, (unsigned long)find_pte_from_reg(address));
 			}
 
-			// Check if other thread already solved this
-			if ((!(error_code & X86_PF_WRITE) && pte_present(*entry)) // Read request
-				|| ((error_code & X86_PF_WRITE) && pte_present(*entry)
-					&& (!(error_code & X86_PF_PROT) || pte_write(*entry)))) // Write request
+			// check other thread already solve this
+			if ((!(error_code & X86_PF_WRITE) && pte_present(*entry)) // read request
+				|| ((error_code & X86_PF_WRITE) && pte_present(*entry) && pte_write(*entry))) // write request // new version have this: !(error_code & X86_PF_PROT) || 
 			{
 return_and_retry:
-				if (likely(spin_is_locked(ptl_ptr)))
+				pr_pgfault("return and retry[%d] cnt[%lu]\n", return_code, return_cnt++);
+				if (likely(ptl_ptr && spin_is_locked(ptl_ptr)))
 					spin_unlock(ptl_ptr);
-
+					// spin_unlock_bh(ptl_ptr);
+// return_and_retry_no_lock:
 				up_read(&mm->mmap_sem);
+
+				if (is_prefetch)
+					return; // simply fail
+
 				PROFILE_START(FH_nack_and_retry_delay);
 				PROFILE_START(FH_nack_for_restore);
 				PROFILE_START(FH_nack_for_inval);
 				PROFILE_START(FH_nack_for_inval_w);
-				// == Help from page fault handler == //
+				// == Help from page fault handler ==
+pr_pgfault("before help_invalidation_and_sleep\n");
 				help_invalidation_and_sleep(back_off_cnt);
+pr_pgfault("after help_invalidation_and_sleep\n");
 				PROFILE_LEAVE(FH_nack_and_retry);
 				if(try_inval_proc)
 				{
-					// Update back-off
+					// update back-off
 					// back_off_cnt *= 2;
 					back_off_cnt ++;
 					if (back_off_cnt >= DISAGG_NACK_MAX_BACKOFF)
@@ -803,7 +876,8 @@ return_and_retry:
 			 */
 			barrier();
 			PROFILE_START(FH_prepare_data);
-			pre_alloc_data = prepare_data_page(tsk->tgid, mm, entry, address, //error_code,
+			pre_alloc_data = prepare_data_page(is_kern_shared_mem ? DISAGG_KERN_TGID : tsk->tgid,
+											   mm, entry, address, // error_code,
 											   (flags & 0xF) & ~VM_WRITE,
 											   &vma, &new_cnreq, &existing_page);
 			pte_value = *entry;
@@ -856,7 +930,8 @@ return_and_retry:
 			}
 #endif
 			PROFILE_START(FH_add_waiting_node);
-			wait_node = add_waiting_node(tsk->tgid, address & PAGE_MASK, new_cnreq);
+			wait_node = add_waiting_node(is_kern_shared_mem ? DISAGG_KERN_TGID : tsk->tgid,
+										 address & PAGE_MASK, new_cnreq);
 			smp_wmb();
 			if (unlikely(!wait_node || (wait_node == (void*)-EAGAIN)))
 			{	// Under eviction
@@ -940,7 +1015,7 @@ return_and_retry:
 			PROFILE_LEAVE_EVAL(FH_ack_waiting_node);
 			PROFILE_LEAVE(FH_succ_net_lat);
 #ifdef PRINT_PAGE_FAULT
-			print_pgfault_error(tsk, error_code, address, vma);
+			print_pgfault_error(tsk, error_code, address, vma, is_prefetch);
 #endif
 			if (fault == DISAGG_FAULT_READ || fault == DISAGG_FAULT_WRITE)
 			{
@@ -954,9 +1029,9 @@ return_and_retry:
 					if (ret_buf.data_size >= PAGE_SIZE)
 					{
 						PROFILE_START(FH_restore_data);
-						if (!restore_data_page(mm, entry, address, error_code,
+						if (!restore_data_page(cur_tsk, entry, address, error_code,
 											   flags, &vma, (unsigned long)ret_buf.data,
-											   new_cnreq, existing_page))
+											   new_cnreq, existing_page, is_prefetch))
 						{
 							clear_responsibility = cnthread_rollback_page_received(new_cnreq);
 							smp_wmb();
@@ -992,6 +1067,11 @@ return_and_retry:
 							PROFILE_LEAVE(FH_latency_500us);
 						else
 							PROFILE_LEAVE(FH_latency_1000us);
+// 						pr_info("end disagg pfault tgid[%d] pid[%d] ip[%lx] addr[%lx] errcode[%lx] CPU[%d]\n",
+// 							tsk->tgid, tsk->pid, regs->ip, address, error_code, smp_processor_id());
+#ifdef DISAGG_ENABLE_PREFETCH
+						pfet_add_struct(tsk, address);
+#endif
 						return;
 					}
 					printk(KERN_DEFAULT "ERROR: fault handler - data from MN is not enough\n");
@@ -1003,7 +1083,7 @@ return_and_retry:
 				// case DISAGG_FAULT_ERR_NO_ANON:
 					printk(KERN_DEFAULT "** Cannot handled by memory node handler err: %d, kern: %d.\n",
 							fault, (error_code & X86_PF_USER) ? 0 : 1);
-					print_pgfault_error(tsk, error_code, address, vma);
+					print_pgfault_error(tsk, error_code, address, vma, is_prefetch);
 					BUG();
 
 				default:
@@ -1022,15 +1102,19 @@ release_write_and_bad_area:
 				pr_pgfault("CN [%d]: put_page (4) 0x%lx\n", cpu_id, address);
 				cnthread_put_page(new_cnreq);
 			}
-			if (is_bad_area)
+			if (is_bad_area && !is_prefetch)
 				goto bad_area;
 			else
 				return;
 		}
+		else if (is_prefetch)
+		{
+			return;	// simply fail
+		}
 	}
 
 // ====== normal Linux routine ===== //
-normal_linux_routine:
+// normal_linux_routine:
 	if (unlikely(!vma)) {
 		goto bad_area;
 	}
@@ -1061,7 +1145,7 @@ bad_area:
 	if (vma)
 		printk(KERN_DEFAULT "CN: BAD AREA- addr: 0x%lx, vma: 0x%lx - 0x%lx [0x%lx]\n",
 			address, vma->vm_start, vma->vm_end, vma->vm_flags);
-	print_pgfault_error(tsk, error_code, address, vma);
+	print_pgfault_error(tsk, error_code, address, vma, is_prefetch);
 	barrier();
 
 	bad_area(regs, error_code, address);
@@ -1075,7 +1159,8 @@ good_area:
 	if (unlikely(access_error(error_code, vma))) {
 		printk(KERN_DEFAULT "CN: GOOD AREA- addr: 0x%lx, vma: 0x%lx - 0x%lx [0x%lx]\n",
 			   address, vma->vm_start, vma->vm_end, vma->vm_flags);
-		print_pgfault_error(tsk, error_code, address, vma);
+		print_pgfault_error(tsk, error_code, address, vma, is_prefetch);
+ 		DEBUG_print_vma(mm);
 		barrier();
 
 		bad_area_access_error(regs, error_code, address, vma);
@@ -1131,4 +1216,17 @@ good_area:
 	}
     // check_v8086_mode(regs, address, tsk);    // ignore this for 64-bit
 }
+
+noinline
+void do_disagg_page_fault(struct task_struct *tsk, struct pt_regs *regs,
+						  unsigned long error_code, unsigned long address, unsigned int flags)
+{
+	_do_disagg_page_fault(tsk, regs, error_code, address, flags, 0);
+	// do_disagg_page_fault_prefetch(tsk, (address & PAGE_MASK) + PAGE_SIZE);
+}
 NOKPROBE_SYMBOL(do_disagg_page_fault);
+
+void do_disagg_page_fault_prefetch(struct task_struct *tsk, unsigned long address)
+{
+	_do_disagg_page_fault(tsk, NULL, X86_PF_WRITE, address, VM_READ | VM_WRITE, 1);
+}

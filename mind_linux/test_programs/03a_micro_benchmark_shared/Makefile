@@ -28,7 +28,13 @@ run_debug: debug
 # make cases: run_shared_(shared ratio)_(read ratio)
 # params: [is_local/debug] [#local thread] [shared data in #pages] [#compute blades] [node_id] [#memory blades] [shared_ratio] [read_ratio] [locality] [local data in #pages] [dummies...]
 # * Currently unused args: #memory blades, locality
+run_shared: test_protocol
+	@bin/test_protocol 0 $(NUM_THREAD) 204800 $(NUM_NODE) $(NODE_ID) 1 $(SRATIO) $(RRATIO) 50 204800 0 shared_$(NODE_ID)_0
 
+run_shared_small: test_protocol
+	@bin/test_protocol 0 $(NUM_THREAD) 20600 $(NUM_NODE) $(NODE_ID) 1 $(SRATIO) $(RRATIO) 50 20600 0 shared_$(NODE_ID)_0
+
+# 
 run_shared_0_0: test_protocol
 	@bin/test_protocol 0 1 204800 $(NUM_NODE) $(NODE_ID) 1 0 0 50 204800 0 shared_$(NODE_ID)_0
 

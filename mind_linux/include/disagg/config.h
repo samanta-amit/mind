@@ -2,8 +2,9 @@
 #define __DISAGG_PROGRAM_CONFIG_H__
 
 // Configuration file for test
-#define TEST_PROGRAM_NAME "test_protocol"
-#define TEST_PROGRAM_DIGIT 13
+#define TEST_PROGRAM_NAME "test_mltthrd"
+#define EXAMPLE_PROGRAM_NAME "exmp_mltthrd"
+#define TEST_PROGRAM_DIGIT 12
 #define REMOTE_THREAD_SLEEP_INIT_IN_SECOND 1
 #define TEST_INIT_ALLOC_SIZE (4 * 1024 * 1024 * 1024UL)  // 4 GB
 #define TEST_MACRO_ALLOC_SIZE (8 * 1024 * 1024 * 1024UL)  // 8 GB
@@ -14,6 +15,13 @@
 #define TEST_PROGRAM_TGID 0
 #define RESET_DIR_WHEN_FAIL 0
 #define TEST_DEBUG_SIZE_LIMIT (256 * 1024 * 1024)
+
+// Kernel shared memory
+#define DISAGG_KERN_SHMEM_SIZE_IN_PAGE (8192)   // 32 MB
+#define DISAGG_KERN_SHMEM_SIZE (DISAGG_KERN_SHMEM_SIZE_IN_PAGE * PAGE_SIZE)
+
+// Process management
+#define MIND_EXIT_RETRY_IN_SEC 5
 
 #ifndef __TEST__
 // Test VMA inditifier: body is inside mmap_disagg.c

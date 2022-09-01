@@ -55,6 +55,8 @@
 #include <disagg/mmap_disagg.h>
 #include <disagg/cnthread_disagg.h>
 #include <disagg/print_disagg.h>
+#include <disagg/fault_disagg.h>
+
 
 #ifndef arch_mmap_check
 #define arch_mmap_check(addr, len, flags)	(0)
@@ -78,11 +80,71 @@ void DEBUG_print_vma(struct mm_struct *mm)
 	}
 }
 
+static void print_page_checksum(void *data_ptr, unsigned long addr) {
+	unsigned long checksum = 0, *itr;
+	for (itr = data_ptr; (char *)itr != ((char *)data_ptr + PAGE_SIZE); ++itr)
+		checksum += *itr;
+	pr_info("addr[%lx] checksum[%lx]\n", addr, checksum);
+}
+
+static int mmap_copy_page_data_to_mn_from_file(struct task_struct *tsk, struct file *vm_file,
+		unsigned long addr, unsigned long len, unsigned long pgoff) {
+    struct fault_data_struct payload;
+    struct fault_reply_struct reply;
+    int ret = 0;
+    size_t data_size = PAGE_SIZE;
+    void *data_ptr = NULL;
+    long bytes;
+	loff_t pos;
+	unsigned long tmp_addr = addr;
+	int eof = 0;
+
+    data_ptr = kzalloc(data_size, GFP_KERNEL);
+    if (!data_ptr) {
+        ret = -ENOMEM;
+        goto out;
+    }
+
+    payload.pid = tsk->pid;
+    payload.tgid = tsk->tgid;
+    payload.data_size = (u32)data_size;
+    payload.data = data_ptr;
+
+	pos = (pgoff << PAGE_SHIFT);
+	for (; !eof && (tmp_addr < addr + len); tmp_addr += data_size) { /*do we increament pos here?*/
+		memset(data_ptr, 0 , data_size);
+    	bytes = kernel_read(vm_file, data_ptr, data_size, &pos);
+    	if (bytes != data_size) {
+        	ret = bytes;
+			pr_err("read %ldB but need %ldB\n", bytes, data_size);
+			eof = 1;
+        	//goto out;
+    	}
+		print_page_checksum(data_ptr, tmp_addr);
+
+		payload.address = tmp_addr;
+		ret = send_msg_to_memory_rdma(DISSAGG_DATA_PUSH, &payload, data_size,
+                                        &reply, sizeof(reply));
+    	if (ret < 0) {
+        	pr_err("Cannot send page data - err: %d\n", ret);
+        	goto out;
+    	}
+		pr_info("page[%lx] sent from file pos[%lx] ret[%d]\n", tmp_addr, (unsigned long)pos, ret);
+	}
+
+out:
+    if (data_ptr)
+	{
+        kfree(data_ptr);
+	}
+	return ret;
+}
+
 
 static unsigned long send_mmap_to_mn(struct task_struct *tsk, unsigned long addr,
 		unsigned long len, unsigned long prot, unsigned long flags, 
 		unsigned long  vm_flags, unsigned long pgoff, struct file *file,
-		int *ownership)
+		int *ownership, int writable_file_map)
 {
     struct mmap_msg_struct payload;
     struct mmap_reply_struct *reply;
@@ -98,13 +160,14 @@ retry_mmap:
 
 	payload.pid = tsk->pid;
 	payload.tgid = tsk->tgid;
+	payload.need_cache_entry = (writable_file_map || !file);
     payload.addr = addr;
 	payload.len = len;
 	payload.prot = prot;
 	payload.flags = flags;
 	payload.vm_flags = vm_flags;
 	payload.pgoff = pgoff;
-	payload.file_id = (unsigned long)file;
+	payload.file_id = writable_file_map ? 0 : ((unsigned long)file);
 
 	// Check the size of the received data
 	ret = send_msg_to_memory(DISSAGG_MMAP, &payload, sizeof(payload),
@@ -125,6 +188,12 @@ retry_mmap:
 		ret_addr = reply->addr;   // set error or addr
 	}
     kfree(reply);
+
+	if (writable_file_map) {
+		pr_info("send writable file mapping[%lx, %lx] to swith\n", addr, addr + len);
+		ret = mmap_copy_page_data_to_mn_from_file(tsk, file, addr, len, pgoff);
+	}
+
     return ret_addr;
 }
 
@@ -138,17 +207,17 @@ unsigned long do_disagg_mmap(struct task_struct *tsk,
 
 	// send mmap request to memory node
 	return send_mmap_to_mn(tsk, addr, len, prot, flags,
-						  	  (unsigned long)vm_flags, pgoff, file, NULL);
+						  	  (unsigned long)vm_flags, pgoff, file, NULL, 0);
 }
 EXPORT_SYMBOL(do_disagg_mmap); // for unit test in RoceModule
 
 unsigned long do_disagg_mmap_owner(struct task_struct *tsk,
             unsigned long addr, unsigned long len, unsigned long prot,
 			unsigned long flags, vm_flags_t vm_flags, unsigned long pgoff,
-			struct file *file, int *ownership)
+			struct file *file, int *ownership, int writable_file_map)
 {
 	return send_mmap_to_mn(tsk, addr, len, prot, flags,
-						   (unsigned long)vm_flags, pgoff, file, ownership);
+						   (unsigned long)vm_flags, pgoff, file, ownership, writable_file_map);
 }
 
 /*

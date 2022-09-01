@@ -71,9 +71,10 @@ enum{
 #ifdef CONFIG_COMPUTE_NODE
 int cn_copy_vma_to_mn(struct task_struct *tsk, u32 msg_type);
 int cn_copy_vma_data_to_mn(struct task_struct *tsk, struct vm_area_struct *vma, 
-		unsigned long start_addr, unsigned long end_addr);
+		unsigned long start_addr, unsigned long end_addr, off_t off_in_vma);
 int cn_copy_page_data_to_mn(u16 tgid, struct mm_struct *mm, unsigned long addr, pte_t *pte,
 							int is_target_data, u32 req_qp, void *dma_addr);
+//int cn_copy_page_data_to_mn_from_file(u16 tgid, struct vm_area_struct *vma, unsigned long addr);
 int count_vm_field(struct task_struct *tsk);
 
 // only for debug

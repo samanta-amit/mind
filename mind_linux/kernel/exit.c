@@ -492,6 +492,8 @@ assign_new_owner:
 }
 #endif /* CONFIG_MEMCG */
 
+#include <disagg/print_disagg.h>
+
 /*
  * Turn us into a lazy TLB process if we
  * aren't already..
@@ -501,7 +503,9 @@ static void exit_mm(void)
 	struct mm_struct *mm = current->mm;
 	struct core_state *core_state;
 
+	print_remote_syscall_only("Before release");
 	mm_release(current, mm);
+	print_remote_syscall_only("After release");
 	if (!mm)
 		return;
 	sync_mm_rss(mm);
@@ -512,6 +516,7 @@ static void exit_mm(void)
 	 * will increment ->nr_threads for each thread in the
 	 * group with ->mm != NULL.
 	 */
+	print_remote_syscall_only("Before core_state");
 	down_read(&mm->mmap_sem);
 	core_state = mm->core_state;
 	if (core_state) {
@@ -537,16 +542,20 @@ static void exit_mm(void)
 		__set_current_state(TASK_RUNNING);
 		down_read(&mm->mmap_sem);
 	}
+	print_remote_syscall_only("After core state");
 	mmgrab(mm);
 	BUG_ON(mm != current->active_mm);
 	/* more a memory barrier than a real lock */
 	task_lock(current);
 	current->mm = NULL;
 	up_read(&mm->mmap_sem);
+	print_remote_syscall_only("Before lazy_tlb");
 	enter_lazy_tlb(mm, current);
 	task_unlock(current);
 	mm_update_next_owner(mm);
+	print_remote_syscall_only("Before mmput");
 	mmput(mm);
+	print_remote_syscall_only("After mmput");
 	if (test_thread_flag(TIF_MEMDIE))
 		exit_oom_victim();
 }
@@ -853,13 +862,33 @@ void __noreturn do_exit(long code)
 
 	tsk->exit_code = code;
 	taskstats_exit(tsk, group_dead);
-	// Cache will be cleared inside exit_mm
-	exit_mm();
+
+	/*
+	* Added for MIND's remote memory system
+	*/
 #ifdef CONFIG_COMPUTE_NODE
-	if (tsk->is_remote){
+	if (tsk->is_remote) {
+		if (tsk->clear_child_tid) {
+			if (!(tsk->signal->flags & SIGNAL_GROUP_COREDUMP) &&
+				atomic_read(&current->mm->mm_users) > 1) {
+				/*
+				* We don't check the error code - if userspace has
+				* not set up a proper pointer then tough luck.
+				*/
+				print_remote_syscall_only("Before put_user");
+				put_user(0, tsk->clear_child_tid);
+				print_remote_syscall_only("Before futex");
+				sys_futex(tsk->clear_child_tid, FUTEX_WAKE,
+						1, NULL, NULL, 0);
+			}
+			tsk->clear_child_tid = NULL;
+		}
+		print_remote_syscall_only("After clear_child_tid");
+		// Now we can send exit msg to ctrl
 		disagg_exit(tsk);
 	}
 #endif
+	exit_mm();	// Cache will be cleared inside exit_mm
 
 	if (group_dead)
 		acct_process();

@@ -14,6 +14,30 @@
 #include <asm/signal.h>
 #include <disagg/cache_config.h>
 
+// == number of workers == //
+#define CNTHREAD_WORKER_NUMBER 1    // assuming there is a main thread,
+                                    // which is not accounted by this value
+
+// == priority task queues == //
+#define CNTHREAD_TASK_QUEUE_NUM 3   // by default, we have queues having different priority
+                                    // for synchronous and asynchronous invalidations and eviction.
+// priority mappings
+#define CNTHREAD_SYNC_INV_PRIO  0
+#define CNTHREAD_ASYNC_INV_PRIO 1
+#define CNTHREAD_EVT_PRIO       2
+
+// return values from task ftn
+#define CNTHREAD_RET_NORMAL     0
+#define CNTHREAD_RET_RETRY      1
+#define CNTHREAD_RET_RELEASE    2
+#define CNTHREAD_RET_NEXT_TASK  3
+#define CNTHREAD_RET_ERROR      -1
+
+// == Prefetcher setup ==
+// #define DISAGG_ENABLE_PREFETCH
+#define PFET_TIMER_INTERVAL_IN_US 100000   // 100 ms for debugging
+
+// == cache capacity setup == //
 // in number of pages: 32768 pages = 128 MB, 131072 = 512 MB
 // (106240)    // 0.415 GB
 // (109445)    // 0.4175 GB 
@@ -24,7 +48,10 @@
 #define CNTHREAD_MAX_CACHE_BLOCK_NUMBER (131072)
 #define CNTHREAD_HIGH_CACHE_PERSSURE    0.9
 #define CNTHREAD_CACHED_PERSSURE        0.85
-#define CNTHREAD_TRY_EVICTION_AGAIN     1
+#define CNTHREAD_INVALIDATION_SUCCESS   1
+#define CNTHREAD_NO_ASYNC_NEEDED        2
+#define CNTHREAD_EVICTION_DATAPUSH      3
+#define CNTHREAD_SYNC_PART_FAILED       -1
 #define CNTHREAD_FETCH_PAGE_BATCH       (CNTHREAD_MAX_CACHE_BLOCK_NUMBER / 100) // 1 %
 #define CNTHREAD_CACHELINE_SIZE_IN_PAGES (CACHELINE_MAX_SIZE/PAGE_SIZE)         // 2 MB
 #define CNTHREAD_CACHELINE_OVERSUB (CNTHREAD_MAX_CACHE_BLOCK_NUMBER / 16)
@@ -38,6 +65,7 @@
 #define PG_FAULT_HELPER_CPU (DISAGG_QP_NUM_INVAL_DATA - 2)
 #define ROCE_FIN_ACK    // send final ack over ROCE
 
+#define LAST_HANDLER_CPU (DISAGG_NUM_CPU_CORE_IN_COMPUTING_BLADE - 1)
 #define EVICT_HANDLER_CPU (DISAGG_NUM_CPU_CORE_IN_COMPUTING_BLADE - 1)
 #define INVAL_HANDLER_CPU (DISAGG_NUM_CPU_CORE_IN_COMPUTING_BLADE - 2)
 struct cnthread_stat
@@ -58,6 +86,17 @@ struct cnthread_handler_data
 {
     int                  *init_stage;
     struct cnthread_stat *stat;
+    int                  pin_core_id;
+    int                  worker_id;     // 0 for main, 1~ for workers
+};
+
+struct cnthread_task_desc
+{
+    int (*init_ftn)(void *);    // some initialization routine
+    int (*main_ftn)(void *);    // actual function body
+    void (*clean_ftn)(int, void *);   // clean up argv and others
+    void *argv; // a pointer to the data structure holding args
+    struct list_head node;
 };
 
 // NOT USED NOW, left here just for compilation
@@ -157,9 +196,13 @@ struct cnthread_inv_msg_ctx
     struct cnthread_rdma_msg_ctx rdma_ctx;
     struct cnthread_cacheline *cnline_ptr;
     int is_locked;
-    struct list_head node;
     unsigned long last_update;
     int is_target_data, remove_data, is_invalid;
+};
+
+struct cnthread_inv_argv
+{
+    struct cnthread_inv_msg_ctx inv_ctx;
 };
 
 enum
@@ -182,6 +225,9 @@ void cnthread_put_page(struct cnthread_req *cnreq);
 void cnthread_create_owner_cacheline(unsigned int tgid, unsigned long addr, struct mm_struct *mm);
 void cnthread_set_page_received(struct cnthread_req *cnreq);
 int cnthread_rollback_page_received(struct cnthread_req *cnreq);
+
+// Workers / task descriptor
+void cnthread_enqueue_task(unsigned int priority, struct cnthread_task_desc* task_desc);
 
 // Functions to add pte to the cache list
 inline int cnthread_add_pte_to_list_with_cnreq(
@@ -219,4 +265,29 @@ void try_invalidation_lookahead(int from_inv, int lookahead);
 void try_invalidation_processing_from_page_fault_handler(struct cnthread_req *cnreq);
 int cnthread_is_pre_owned(struct cnthread_req *cnreq, unsigned int tgid, unsigned long address);
 
+// == KERN_SHMEM == //
+// - interface for kernel side shared memory
+void prealloc_kernel_shared_mem(void);
+void init_kernel_shared_mem(void);
+void *alloc_kshmem(unsigned long size);
+void free_kshmem(void *alloc_va);
+int is_kshmem_available(void);
+unsigned long kshmem_get_start_va(void);
+int is_kshmem_address(unsigned long addr);
+
+// == PREFETCH == //
+struct fault_stat_struct {
+	struct task_struct *tsk;
+    u64 vaddr;
+	struct list_head node;
+} __packed;
+
+#define PREFETCH_PGFAULT_MAX_STAT   10000
+
+void init_pgfault_prefetch(void);
+struct fault_stat_struct *pfet_get_struct(void);
+int pfet_add_struct(struct task_struct *tsk, u64 fva);
+void pfet_prefetch_entry(void);
+// timer
+int pfet_timer_handler(void *data);
 #endif  /* __CNTHREAD_DISAGGREGATION_H__ */

@@ -402,7 +402,7 @@ static int do_mprotect_pkey(unsigned long start, size_t len,
 				(prot & PROT_READ);
 
 #ifdef CONFIG_COMPUTE_NODE
-	if (current->is_remote && !current->is_test)
+	if (current->is_remote/* && !current->is_test*/)
 	{
 		// skip mprotection
 		return 0;
@@ -438,6 +438,7 @@ static int do_mprotect_pkey(unsigned long start, size_t len,
 		goto out;
 
 	vma = find_vma(current->mm, start);
+    /*
 #ifdef CONFIG_COMPUTE_NODE
 	if (current->is_remote && current->is_test)
 	{
@@ -445,11 +446,12 @@ static int do_mprotect_pkey(unsigned long start, size_t len,
 			   start, len);
 		if (vma && TEST_is_test_vma(vma->vm_start, vma->vm_end))
 		{
-			// Skip mprotection for test vmas (manually configured exceptional vmas)
+			// remote memory - skip mprotection
 			return 0;
 		}
 	}
 #endif
+*/
 	error = -ENOMEM;
 	if (!vma)
 		goto out;

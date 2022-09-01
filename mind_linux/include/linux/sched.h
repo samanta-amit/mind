@@ -663,6 +663,7 @@ struct task_struct {
 	pid_t 				r_tgid;
 	bool				is_remote;
 	bool 				is_test;
+	bool 				run_on_other_node;
 
 #ifdef CONFIG_CC_STACKPROTECTOR
 	/* Canary value for the -fstack-protector GCC feature: */

@@ -1239,6 +1239,8 @@ void __init kmem_cache_init(void)
 					sizeof(struct rcu_head));
 	kmem_cache = &kmem_cache_boot;
 
+	struct kmem_cache_node **kmalloc_simplefs_caches;
+
 	if (!IS_ENABLED(CONFIG_NUMA) || num_possible_nodes() == 1)
 		use_alien_caches = 0;
 
@@ -1308,6 +1310,8 @@ void __init kmem_cache_init(void)
 					  &init_kmem_cache_node[SIZE_NODE + nid], nid);
 		}
 	}
+
+	init_list(kmalloc_simplefs_caches[INDEX_NODE], &init_superfs_kmem_cache_node[0], 0);
 
 	create_kmalloc_caches(ARCH_KMALLOC_FLAGS);
 }

@@ -58,6 +58,7 @@ struct vmap_area {
 extern void vm_unmap_ram(const void *mem, unsigned int count);
 extern void *vm_map_ram(struct page **pages, unsigned int count,
 				int node, pgprot_t prot);
+extern void *vm_map_va_only(unsigned long start, unsigned long end, unsigned long size);
 extern void vm_unmap_aliases(void);
 
 #ifdef CONFIG_MMU

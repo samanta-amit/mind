@@ -72,6 +72,9 @@
 
 #include "locking/rtmutex_common.h"
 
+#include <disagg/futex_disagg.h>
+#include <disagg/print_disagg.h>
+
 /*
  * READ this before attempting to hack on futexes!
  *
@@ -3578,6 +3581,17 @@ SYSCALL_DEFINE6(futex, u32 __user *, uaddr, int, op, u32, val,
 	ktime_t t, *tp = NULL;
 	u32 val2 = 0;
 	int cmd = op & FUTEX_CMD_MASK;
+
+#ifdef CONFIG_COMPUTE_NODE
+	if (current->is_remote) {
+		//pr_futex("futex[%s] tgid[%d] uaddr[%lu] op[%x] cmd[%x]\n",current->comm, current->tgid, (u64)uaddr, op, cmd);
+		if (cmd != FUTEX_WAIT && cmd != FUTEX_WAKE && cmd != FUTEX_WAIT_BITSET && cmd != FUTEX_WAKE_BITSET) {
+			pr_err("abnormal futex op[%d]\n", cmd);
+		} else {
+			return do_disagg_futex(uaddr, op, val, tp, uaddr2, val2, val3);
+		}
+	}
+#endif
 
 	if (utime && (cmd == FUTEX_WAIT || cmd == FUTEX_LOCK_PI ||
 		      cmd == FUTEX_WAIT_BITSET ||

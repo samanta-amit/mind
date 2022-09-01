@@ -73,6 +73,10 @@
 #define DISAGG_MEM_INIT				31
 #define DISAGG_MEM_COPY				32
 #define DISAGG_RDMA         		51
+#define DISAGG_REMOTE_THREAD        61
+#define DISAGG_CONN_USAGE_REMOTE_FORK        62
+#define DISAGG_FUTEX				71
+#define DISAGG_KSHMEM_ALLOC			81		// kernel side shared memory
 #define DISSAGG_FIN_CONN    		99
 
 #define DISSAGG_COPY_VMA    		101     // debugging purpose
@@ -160,7 +164,8 @@
 #define CACHELINE_PREFIX (64 - CACHELINE_SHIFT)
 #define CACHELINE_MASK ((1 << CACHELINE_SHIFT) - 1)
 //
-#define MN_VA_MIN_ADDR CACHELINE_MAX_SIZE
+//#define MN_VA_MIN_ADDR CACHELINE_MAX_SIZE
+#define MN_VA_MIN_ADDR (1 << 24)
 
 // port for TCP and UDP
 #ifndef DEFAULT_PORT
@@ -185,11 +190,12 @@
 
 #define _destport (DEFAULT_PORT)
 
-#define DISAGG_MEMORY_NODE_ID   1
-#define DISAGG_CONTROLLER_NODE_ID 0
-
-#define DISAGG_COMPUTE_NODE_IP_START 201
-#define DISAGG_MEMORY_NODE_IP_START 221
+#include "cluster_disagg.h"
+// #define DISAGG_MEMORY_NODE_ID   1
+// #define DISAGG_CONTROLLER_NODE_ID 0
+// 
+// #define DISAGG_COMPUTE_NODE_IP_START 201
+// #define DISAGG_MEMORY_NODE_IP_START 221
 
 #define DISAGG_MAGIC_NUMBER_FOR_TEST 0x1f2e3d4c
 

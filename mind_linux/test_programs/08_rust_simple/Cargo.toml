@@ -1,0 +1,13 @@
+[package]
+name = "test_protocol"
+version = "0.1.0"
+edition = "2018"
+
+[[bin]]
+name = "test_protocol"
+path = "src/test_protocol.rs"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+libc = "0.2"

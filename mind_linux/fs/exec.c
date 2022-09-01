@@ -31,6 +31,7 @@
 #include <linux/fork.h>
 #include <disagg/config.h>
 #include <disagg/exec_disagg.h>
+extern void DEBUG_print_vma(struct mm_struct *mm);
 #endif
 
 #include <trace/events/sched.h>
@@ -1678,6 +1679,7 @@ static int do_execveat_common(int fd, struct filename *filename,
 	struct files_struct *displaced;
 	int retval;
 	struct mm_struct *mm;
+	int will_be_remote = 0;
 
 #ifdef CONFIG_COMPUTE_NODE
 	char tmp[TEST_PROGRAM_DIGIT + 1];
@@ -1697,11 +1699,23 @@ static int do_execveat_common(int fd, struct filename *filename,
 		current->tgid = TEST_PROGRAM_TGID;
 		if (!current->is_remote)
 		{
-			current->is_remote = 1;
+			will_be_remote = 1;
+			//current->is_remote = 1;
 			// send fork request to switch here
-			disagg_fork_report_only(current);
+			// disagg_fork_report_only(current);
+		} else {
+			pr_err("test program should not be remote at first\n");
 		}
 	}
+	// else if (strcmp(tmp, EXAMPLE_PROGRAM_NAME) == 0) {
+	// 	current->is_example = 1;
+	// 	pr_err("example program found tgid[%d] pid[%d]\n", current->tgid, current->pid);
+	// } 
+	else {
+		//pr_err("program name n[%s] tmp[%s]\n", n, tmp);
+		;
+	}
+
 #endif
 
 	/*
@@ -1805,6 +1819,7 @@ static int do_execveat_common(int fd, struct filename *filename,
 	/* execve succeeded */
 	// new process just started from the last exec_binprm call
 #ifdef CONFIG_COMPUTE_NODE
+	current->is_remote = will_be_remote;
 	if(current->is_remote){
 		printk(KERN_DEFAULT "execve: %s (uid:%d, pid:%d)\n", 
 				current->comm, (int)current->cred->uid.val,
@@ -1827,6 +1842,11 @@ static int do_execveat_common(int fd, struct filename *filename,
 		
 		up_write(&mm->mmap_sem);
 	}
+	/*
+	else if (current->is_example) {
+		DEBUG_print_vma(mm);
+	}
+	*/
 #endif
 	current->fs->in_exec = 0;
 	current->in_execve = 0;

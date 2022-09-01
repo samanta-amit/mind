@@ -8,10 +8,14 @@
 #endif
 
 #define ERR_DISAGG_EXIT_NO_TASK		1
+#define ERR_DISAGG_REMOTE_WAIT_EXIT 2
+#define EXIT_FIRST_TRY				10
+#define EXIT_RETRY					11
 
 struct exit_msg_struct {
 	u32	pid;
 	u32	tgid;
+	u64 flag;
 } __packed;
 
 struct exit_reply_struct {

@@ -16,4 +16,6 @@ unset MLX5_SHUT_UP_BF
 # ping -c 3 10.10.10.101
 # sh 13_register_vm_arp.sh ens9
 sudo arp -i ens9 -s 10.10.10.1 00:02:00:00:03:00
+sudo arp -i ens9 -s 10.10.10.221 04:3f:72:a2:b7:3a
+sudo arp -i ens9 -s 10.10.10.201 04:3f:72:a2:b4:a2 & sudo arp -i ens9 -s 10.10.10.202 04:3f:72:a2:b4:a3 & sudo arp -i ens9 -s 10.10.10.203 04:3f:72:a2:b5:f2 & sudo arp -i ens9 -s 10.10.10.204 04:3f:72:a2:b5:f3 & sudo arp -i ens9 -s 10.10.10.205 0c:42:a1:41:8b:5a & sudo arp -i ens9 -s 10.10.10.206 0c:42:a1:41:8b:5b & sudo arp -i ens9 -s 10.10.10.207 04:3f:72:a2:b0:12 & sudo arp -i ens9 -s 10.10.10.208 04:3f:72:a2:b0:13 & wait
 sudo ibv_devinfo

@@ -41,6 +41,8 @@ struct rdma_msg_struct {
     //only first half will be used (carrying raw data not string)
     char gid[sizeof(DISAGG_RDMA_GID_FORMAT)];
     u64 base_addr;
+    // kernel shared memory
+    u64 kshmem_va_start;
 } __packed;
 
 typedef int (*rdma_msg_callback)(u32, void *, u32, void *, u32);

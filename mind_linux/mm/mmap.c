@@ -206,7 +206,7 @@ if (down_write_killable(&mm->mmap_sem))
 		return -EINTR;
 
 #ifdef CONFIG_COMPUTE_NODE
-	if (current->is_remote && !current->is_test)
+	if (current->is_remote /*&& !current->is_test*/)
 	{
 		mn_retval = disagg_brk(current, brk);	// new brk address (not brk)
 		if (mn_retval > 0)	// not NULL
@@ -309,8 +309,9 @@ set_brk:
 
 mn_brk:
 #ifdef CONFIG_COMPUTE_NODE
-	if (current->is_remote && !current->is_test)
+	if (current->is_remote /*&& !current->is_test*/)
 	{
+		// DEBUG_print_vma(mm);
 		pr_syscall(KERN_DEFAULT "BRK (local) - allocated addr: 0x%lx -> 0x%lx\n",
 				   oldbrk, newbrk);
 		pr_syscall(KERN_DEFAULT "BRK (remote) - allocated addr: 0x%lx\n", mn_retval);
@@ -1462,44 +1463,69 @@ unsigned long do_mmap(struct file *file, unsigned long addr,
 		return -ENOMEM;
 
 #ifdef CONFIG_COMPUTE_NODE
-	if (current->is_remote && current->is_test 
-		&& ((flags & 0xff) != TEST_ALLOC_FLAG) && ((flags & 0xff) != TEST_ALLOC_FILE_FLAG))
+	if (0/*current->is_remote && current->is_test && ((flags & 0xff) != TEST_ALLOC_FLAG)*/)
 	{
 		pr_syscall(KERN_DEFAULT "MMAP (test) - addr: 0x%lx, len: %lu (f: %d), prot: 0x%lx, vmflag: 0x%lx, flag: 0x%lx\n",
 				   addr, len, file ? 1 : 0,
 				   prot, vm_flags, flags);
+		// any normal  - skip remote mmap
 	}
+	// ONLY FOR DEBUGGING
+	// else if (current->is_test)
+	// {
+	// 	if (current->is_test && (flags & 0xff) == TEST_ALLOC_FLAG)
+	// 	{
+	// 		flags = MAP_PRIVATE | MAP_ANONYMOUS;
+	// 	}
+	// 	// print_remote_alloc(len);
+	// 	printk(KERN_DEFAULT "MMAP (request, R%d/T%d) - addr: 0x%lx, len: %lu (f: %d), prot: 0x%lx, vmflag: 0x%lx, flag: 0x%lx\n",
+	// 		   current->is_remote, current->is_test, addr, len, file ? 1 : 0,
+	// 		   prot, vm_flags, flags);
+	// }
 	else if (current->is_remote)
 	{
 		int ownership = 0;
+		int writable_file_map = 0;
+        /*
 		if (current->is_test && (flags & 0xff) == TEST_ALLOC_FLAG)
 		{
 			flags = MAP_PRIVATE | MAP_ANONYMOUS;
 		}
-		pr_syscall(KERN_DEFAULT "MMAP (request, R%d/T%d) - addr: 0x%lx, len: %lu (f: %d), prot: 0x%lx, vmflag: 0x%lx, flag: 0x%lx\n",
+        */
+		// print_remote_alloc(len);
+		pr_info(KERN_DEFAULT "MMAP (request, R%d/T%d) - addr: 0x%lx, len: %lu (f: %d), prot: 0x%lx, vmflag: 0x%lx, flag: 0x%lx\n",
 				   current->is_remote, current->is_test, addr, len, file ? 1 : 0,
 				   prot, vm_flags, flags);
+		// DEBUG_print_vma(mm);
 
-		if (!file && (flags & MAP_TYPE) != MAP_SHARED)	// for the file, use the returned address from memory node
+		//TODO: same as what we do in exec, make switch think writable
+		//file mappings are anonymous, then push data to it
+		if (current->is_remote && (prot & PROT_WRITE) && file) {
+			pr_info("writable file map set\n");
+			writable_file_map = 1;
+		}
+
+		if (writable_file_map || (!file && (flags & MAP_TYPE) != MAP_SHARED))	// for the file, use the returned address from memory node
 		{
 			vm_flags |= calc_vm_prot_bits(prot, pkey) | calc_vm_flag_bits(flags) |
 					mm->def_flags | VM_MAYREAD | VM_MAYWRITE | VM_MAYEXEC;
 		}
 
+		// we do not handle file-backed mmap here
 		mn_addr = do_disagg_mmap_owner(current, addr, len,
-									   prot, flags, vm_flags, pgoff, file, &ownership);
+									   prot, flags, vm_flags, pgoff, file, &ownership, writable_file_map);
 
 		if (IS_ERR_VALUE(mn_addr))
 		{
 			printk(KERN_DEFAULT "MMAP (Err: %ld) - addr: 0x%lx, len: %lu (f: %d)\n", 
 				(long)mn_addr, addr, len, file ? 1 : 0);
-			return mn_addr;	// Return error
+			return mn_addr;	//return error
 		}else{
 			struct rb_node **rb_link, *rb_parent;
 			struct vm_area_struct *prev;
 			int err;
 
-			// Remove previous mappings - it should not find any
+			// remove previous mappings - it should not find any
 			while (find_vma_links(mm, mn_addr, mn_addr + len, &prev, &rb_link, &rb_parent))
 			{
 				err = do_munmap(mm, mn_addr, len, uf);
@@ -1513,7 +1539,7 @@ unsigned long do_mmap(struct file *file, unsigned long addr,
 			}
 		}
 
-		if (!file && (flags & MAP_TYPE) != MAP_SHARED)
+		if (writable_file_map || (!file && (flags & MAP_TYPE) != MAP_SHARED))
 		{
 			vm_flags_t any_access = VM_READ | VM_WRITE | VM_EXEC | VM_MAYREAD | VM_MAYWRITE | VM_MAYEXEC;
 			if (ownership){
@@ -1527,13 +1553,13 @@ unsigned long do_mmap(struct file *file, unsigned long addr,
 						break;
 				}
 			}
-			if (IS_ERR_VALUE(mmap_dummy_region(mm, mn_addr, len, vm_flags & ~(any_access)))) // No write permission
+			if (IS_ERR_VALUE(mmap_dummy_region(mm, mn_addr, len, vm_flags & ~(any_access)))) // no write permission
 			{
 				addr = -ENOMEM;
 				goto mmap_out;
 			}else{
 				addr = mn_addr;
-				goto mmap_out;	// Skip the local allocation routine
+				goto mmap_out;	//skip the local mapping
 			}
 		}
 	}
@@ -1543,9 +1569,21 @@ unsigned long do_mmap(struct file *file, unsigned long addr,
 	 * that it represents a valid section of the address space.
 	 */
 #ifdef CONFIG_COMPUTE_NODE
-	/* DEBUG: this is the local address allocation just for comparison with remote one */
+	/* with disagg memory */
+	// if (current->is_remote){
+	// 	addr = mn_addr;
+	// 	lo_addr = get_unmapped_area(file, addr, len, pgoff, flags);
+	// }else{
+	// 	addr = get_unmapped_area(file, addr, len, pgoff, flags);
+	// }
+
+	/* DEBUG without disagg memory */
 	addr = get_unmapped_area(file, addr, len, pgoff, flags);
 	lo_addr = addr;
+	//also set addr tobe mn_addr for file mappings
+	if (current->is_remote && current->is_test) {
+		addr = mn_addr;
+	}
 #else
 	addr = get_unmapped_area(file, addr, len, pgoff, flags);
 #endif
@@ -1726,12 +1764,14 @@ mmap_out:
 	{
 		if (!IS_ERR_VALUE(addr))
 		{
+			/* DEBUG */
+			// WARN_ON(addr != mn_addr);
 			if (file){
 				// We already requested address for file-backed mapping
-				pr_syscall(KERN_DEFAULT "MMAP (remote tgid:%u) - mn_addr: 0x%lx, lo_addr: 0x%lx, len: %lu (f)\n",
+				pr_info(KERN_DEFAULT "MMAP (remote tgid:%u) - mn_addr: 0x%lx, lo_addr: 0x%lx, len: %lu (f)\n",
 						   (unsigned)current->tgid, mn_addr, lo_addr, len);
 			}else{
-				pr_syscall(KERN_DEFAULT "MMAP (remote tgid:%u) - addr: 0x%lx, lo_addr: 0x%lx, len: %lu, flag: 0x%lx, pkey: %d\n",
+				pr_info(KERN_DEFAULT "MMAP (remote tgid:%u) - addr: 0x%lx, lo_addr: 0x%lx, len: %lu, flag: 0x%lx, pkey: %d\n",
 						   (unsigned)current->tgid, addr, lo_addr, len, vm_flags, pkey);
 				// DEBUG_print_vma(mm);
 			}		
@@ -3152,13 +3192,17 @@ SYSCALL_DEFINE2(munmap, unsigned long, addr, size_t, len)
 #ifdef CONFIG_COMPUTE_NODE
 	if (current->is_remote)
 	{
-		struct vm_area_struct *vma = find_vma(current->mm, addr);
+		/*
+        struct vm_area_struct *vma = find_vma(current->mm, addr);
 		if (current->is_test && vma && vma->vm_start <= addr && vma->vm_file)
 		{
-			; // skip file mapping for test process
+			;//skip for file mapping
 		}else{
+        */
 			mn_retval = disagg_munmap(current, addr, len);
-		}
+		//}
+
+		// DEBUG_print_vma(mm);
 		pr_syscall(KERN_DEFAULT "MUNMAP (local) - addr: 0x%lx, len: %lu, res: %d\n",
 				   addr, len, retval);
 		pr_syscall(KERN_DEFAULT "MUNMAP (remote) - res: %d\n", mn_retval);
